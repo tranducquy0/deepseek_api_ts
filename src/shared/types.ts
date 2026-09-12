@@ -32,6 +32,8 @@ export interface OpenAIChatRequest {
   thinking?: boolean;
   tools?: OpenAITool[];
   tool_choice?: string | { type: "function"; function: { name: string } };
+  /** Optional stable conversation identity used to key DeepSeek sessions */
+  user?: string;
 }
 
 export interface OpenAIChunk {

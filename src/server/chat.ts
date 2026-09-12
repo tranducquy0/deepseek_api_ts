@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import { DeepSeekClient, AuthExpiredError } from "../deepseek/client.js";
 import type {
@@ -6,6 +7,7 @@ import type {
   OpenAIMessage,
   OpenAIToolCall,
 } from "../shared/types.js";
+import { SessionManager } from "./sessions.js";
 import {
   buildPrompt,
   createStreamState,
@@ -33,40 +35,33 @@ function resolveThinking(body: OpenAIChatRequest, modelId: string): boolean {
   return modelId === "deepseek-reasoner";
 }
 
-// Session map: tracks DeepSeek session IDs for multi-turn conversations
-// Keyed by a conversation hash derived from the first message
-const sessionMap = new Map<string, string>();
-const SESSION_TTL = 60 * 60 * 1000; // 1 hour
-const sessionTimestamps = new Map<string, number>();
+// Tracks DeepSeek sessions across turns, keyed by conversation.
+const sessions = new SessionManager();
 
-function getOrCreateSession(
-  client: DeepSeekClient,
-  conversationKey: string
-): Promise<string> {
-  const existing = sessionMap.get(conversationKey);
-  if (existing) {
-    const ts = sessionTimestamps.get(conversationKey) ?? 0;
-    if (Date.now() - ts < SESSION_TTL) return Promise.resolve(existing);
-  }
-  return client.createSession().then((id) => {
-    sessionMap.set(conversationKey, id);
-    sessionTimestamps.set(conversationKey, Date.now());
-    return id;
-  });
+/**
+ * Derive a stable conversation key. Prefer the optional `user` field
+ * (the OpenAI convention for a stable identity); otherwise fall back to
+ * a hash of the first user message, which never changes across turns.
+ */
+function conversationKey(body: OpenAIChatRequest): string {
+  if (typeof body.user === "string" && body.user.length > 0) return body.user;
+  const first = body.messages.find((m) => m.role === "user");
+  const seed = first?.content ?? "";
+  return createHash("sha256").update(seed).digest("hex").slice(0, 32);
 }
 
-function cleanupSessions(): void {
-  const now = Date.now();
-  for (const [key, ts] of sessionTimestamps) {
-    if (now - ts > SESSION_TTL) {
-      sessionMap.delete(key);
-      sessionTimestamps.delete(key);
-    }
-  }
+/**
+ * Select only the messages the DeepSeek session has not forwarded yet,
+ * so history is not duplicated on every turn. Falls back to the last
+ * message when nothing new is pending (e.g. the client re-sent history).
+ */
+function forwardMessages(
+  messages: OpenAIMessage[],
+  forwarded: number
+): OpenAIMessage[] {
+  const delta = messages.slice(forwarded);
+  return delta.length > 0 ? delta : messages.slice(-1);
 }
-
-// Periodic cleanup
-setInterval(cleanupSessions, 5 * 60 * 1000);
 
 export function chatRouter(getClient: () => DeepSeekClient): Router {
   const router = Router();
@@ -86,16 +81,15 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
     const stream = body.stream ?? true;
 
     try {
-      // Build a conversation key from the first user message
-      const convKey = body.messages
-        .filter((m: OpenAIMessage) => m.role === "user")
-        .map((m: OpenAIMessage) => m.content ?? "")
-        .join("|")
-        .slice(0, 100);
-
-      const sessionId = await getOrCreateSession(client, convKey);
-      const prompt = buildPrompt(body.messages, body.tools, body.tool_choice);
+      const convKey = conversationKey(body);
+      const entry = await sessions.getOrCreate(client, convKey);
+      const prompt = buildPrompt(
+        forwardMessages(body.messages, entry.lastMessageCount),
+        body.tools,
+        body.tool_choice
+      );
       const hasTools = !!body.tools?.length;
+      let parentId: string | null = entry.parentMessageId;
 
       if (stream) {
         // ── Streaming response ──────────────────────────────
@@ -108,11 +102,10 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
         const initChunk = makeChunk(modelId, { role: "assistant" }, null);
         res.write(`data: ${JSON.stringify(initChunk)}\n\n`);
 
-        let parentId: string | null = null;
         const state = createStreamState(hasTools);
 
         for await (const event of client.chatCompletion({
-          chatSessionId: sessionId,
+          chatSessionId: entry.sessionId,
           parentMessageId: parentId,
           prompt,
           thinkingEnabled,
@@ -133,6 +126,14 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
           if (state.finished) break;
         }
 
+        sessions.update(convKey, {
+          parentMessageId:
+            state.responseMessageId != null
+              ? String(state.responseMessageId)
+              : parentId,
+          messageCount: body.messages.length,
+        });
+
         // In tool mode the raw JSON was buffered — emit it as a tool call
         const toolCall = extractToolCall(state);
         if (toolCall) {
@@ -151,11 +152,10 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
         res.end();
       } else {
         // ── Non-streaming response ──────────────────────────
-        let parentId: string | null = null;
         const state = createStreamState(hasTools);
 
         for await (const event of client.chatCompletion({
-          chatSessionId: sessionId,
+          chatSessionId: entry.sessionId,
           parentMessageId: parentId,
           prompt,
           thinkingEnabled,
@@ -167,6 +167,14 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
           }
           if (state.finished) break;
         }
+
+        sessions.update(convKey, {
+          parentMessageId:
+            state.responseMessageId != null
+              ? String(state.responseMessageId)
+              : parentId,
+          messageCount: body.messages.length,
+        });
 
         const toolCall = extractToolCall(state);
         const message: OpenAIMessage =
