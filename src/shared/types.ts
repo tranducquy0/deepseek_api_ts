@@ -17,8 +17,10 @@ export interface Cookie {
 // ── OpenAI types ────────────────────────────────────────────────────
 
 export interface OpenAIMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_calls?: OpenAIToolCall[];
+  tool_call_id?: string;
 }
 
 export interface OpenAIChatRequest {
@@ -28,6 +30,8 @@ export interface OpenAIChatRequest {
   temperature?: number;
   max_tokens?: number;
   thinking?: boolean;
+  tools?: OpenAITool[];
+  tool_choice?: string | { type: "function"; function: { name: string } };
 }
 
 export interface OpenAIChunk {
@@ -38,7 +42,7 @@ export interface OpenAIChunk {
   choices: {
     index: number;
     delta: Partial<OpenAIMessage>;
-    finish_reason: "stop" | "length" | null;
+    finish_reason: "stop" | "length" | "tool_calls" | null;
   }[];
 }
 
@@ -52,6 +56,29 @@ export interface OpenAIModel {
 export interface OpenAIModelList {
   object: "list";
   data: OpenAIModel[];
+}
+
+// ── Tool calling ────────────────────────────────────────────────────
+
+export interface OpenAIToolFunction {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>;
+}
+
+export interface OpenAITool {
+  type: "function";
+  function: OpenAIToolFunction;
+}
+
+export interface OpenAIToolCall {
+  index?: number;
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
 }
 
 // ── DeepSeek internal types ─────────────────────────────────────────
