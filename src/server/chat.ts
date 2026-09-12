@@ -46,7 +46,10 @@ const sessions = new SessionManager();
 function conversationKey(body: OpenAIChatRequest): string {
   if (typeof body.user === "string" && body.user.length > 0) return body.user;
   const first = body.messages.find((m) => m.role === "user");
-  const seed = first?.content ?? "";
+  const raw = first?.content ?? "";
+  const seed = Array.isArray(raw)
+    ? raw.map((p) => (typeof p === "string" ? p : p.text ?? "")).join("")
+    : raw;
   return createHash("sha256").update(seed).digest("hex").slice(0, 32);
 }
 
