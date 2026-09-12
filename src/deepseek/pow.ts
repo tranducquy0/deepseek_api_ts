@@ -112,6 +112,8 @@ function solvePure(bc: DSBreadcrumb): number | null {
   return null;
 }
 
+export { deepSeekHash, solvePure };
+
 // ── WASM solver (official DeepSeek module) ──────────────────────────
 
 interface WasmSolver {

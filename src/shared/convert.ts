@@ -143,13 +143,15 @@ export function applyStreamEvent(
     state.responseMessageId = event.response_message_id;
   }
 
-  if (!event.p || !event.o) return "";
+  if (!event.p) return "";
 
-  // Check for finish
+  // Check for finish (status events carry no operation field)
   if (event.p === "response/status" && event.v === "FINISHED") {
     state.finished = true;
     return "";
   }
+
+  if (!event.o) return "";
 
   // Handle content append
   if (event.p.includes("/content") && !event.p.includes("thinking")) {
