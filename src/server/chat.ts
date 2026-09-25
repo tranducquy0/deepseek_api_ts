@@ -57,12 +57,21 @@ function conversationKey(body: OpenAIChatRequest): string {
  * Select only the messages the DeepSeek session has not forwarded yet,
  * so history is not duplicated on every turn. Falls back to the last
  * message when nothing new is pending (e.g. the client re-sent history).
+ *
+ * When continuing an existing session (`forwarded > 0`), leading assistant
+ * messages in `delta` are skipped because the DeepSeek session already holds
+ * the assistant's previous response as the parent message node.
  */
-function forwardMessages(
+export function forwardMessages(
   messages: OpenAIMessage[],
   forwarded: number
 ): OpenAIMessage[] {
-  const delta = messages.slice(forwarded);
+  let delta = messages.slice(forwarded);
+  if (forwarded > 0) {
+    while (delta.length > 0 && delta[0].role === "assistant") {
+      delta = delta.slice(1);
+    }
+  }
   return delta.length > 0 ? delta : messages.slice(-1);
 }
 
@@ -137,9 +146,13 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
           messageCount: body.messages.length,
         });
 
-        // In tool mode the raw JSON was buffered — emit it as a tool call
+        // In tool mode, inspect the full buffered state
         const toolCall = extractToolCall(state);
         if (toolCall) {
+          if (toolCall.leadingText) {
+            const leadingChunk = makeChunk(modelId, { content: toolCall.leadingText });
+            res.write(`data: ${JSON.stringify(leadingChunk)}\n\n`);
+          }
           const chunk = makeToolCallChunk(modelId, toolCall);
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         } else if (state.hasTools && state.content) {
@@ -184,7 +197,7 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
           toolCall
             ? {
                 role: "assistant",
-                content: null,
+                content: toolCall.leadingText || null,
                 tool_calls: [
                   {
                     id: toolCall.id,

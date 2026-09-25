@@ -72,8 +72,7 @@ describe("buildPrompt", () => {
       },
       { role: "tool", tool_call_id: "call_1", content: "Sunny" },
     ]);
-    expect(prompt).toContain("[Tool call]: get_weather");
-    expect(prompt).toContain('{"city":"Hanoi"}');
+    expect(prompt).toContain('{"name":"get_weather","arguments":{"city":"Hanoi"}}');
     expect(prompt).toContain("[Tool result for call_1]: Sunny");
   });
 
@@ -132,6 +131,7 @@ describe("parseToolCall", () => {
     const call = parseToolCall('{"name":"get_weather","arguments":{"city":"Hanoi"}}');
     expect(call?.name).toBe("get_weather");
     expect(JSON.parse(call!.arguments)).toEqual({ city: "Hanoi" });
+    expect(call?.leadingText).toBeUndefined();
   });
 
   it("parses fenced JSON", () => {
@@ -140,11 +140,12 @@ describe("parseToolCall", () => {
     expect(JSON.parse(call!.arguments)).toEqual({ q: "x" });
   });
 
-  it("parses JSON embedded in prose", () => {
+  it("parses JSON embedded in prose and captures leading text", () => {
     const call = parseToolCall(
       'Let me check that.\n{"name":"f","arguments":{}}\nDone.'
     );
     expect(call?.name).toBe("f");
+    expect(call?.leadingText).toBe("Let me check that.");
   });
 
   it("returns null for non-JSON answers", () => {
@@ -153,6 +154,7 @@ describe("parseToolCall", () => {
     expect(parseToolCall('{"name":"","arguments":{}}')).toBeNull();
   });
 });
+
 
 describe("extractToolCall", () => {
   it("extracts a tool call only in tool mode", () => {

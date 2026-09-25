@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import express from "express";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { chatRouter } from "./chat.js";
+import { chatRouter, forwardMessages } from "./chat.js";
 import type { DSStreamEvent, OpenAIChatRequest } from "../shared/types.js";
 import type { DeepSeekClient } from "../deepseek/client.js";
 
@@ -115,10 +115,26 @@ describe("chatRouter", () => {
     expect(client.chatCalls[1].chatSessionId).toBe(client.chatCalls[0].chatSessionId);
     // Parent id persisted from turn one's response_message_id
     expect(client.chatCalls[1].parentMessageId).toBe("12345");
-    // Only the not-yet-forwarded messages are sent, not the whole history
+    // Previous assistant message is skipped when forwarded > 0 because parentMessageId holds it
     expect(client.chatCalls[1].prompt).not.toContain("Chain me please");
-    expect(client.chatCalls[1].prompt).toContain("[Assistant]: Hello there");
+    expect(client.chatCalls[1].prompt).not.toContain("[Assistant]: Hello there");
     expect(client.chatCalls[1].prompt).toContain("Continue");
+  });
+
+  it("forwardMessages skips leading assistant messages when forwarded > 0", () => {
+    const messages = [
+      { role: "user", content: "Turn 1" },
+      { role: "assistant", content: "Resp 1" },
+      { role: "tool", content: "Tool output" },
+      { role: "user", content: "Turn 2" },
+    ] as const;
+
+    // Turn 1 forwarded 1 message
+    const delta = forwardMessages(messages as any, 1);
+    expect(delta).toEqual([
+      { role: "tool", content: "Tool output" },
+      { role: "user", content: "Turn 2" },
+    ]);
   });
 
   it("streams SSE events", async () => {

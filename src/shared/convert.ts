@@ -38,14 +38,25 @@ export function buildPrompt(
         parts.push(msg.content ?? "");
         break;
       case "assistant":
+        if (msg.content) parts.push(`[Assistant]: ${msg.content}`);
         if (msg.tool_calls?.length) {
           for (const tc of msg.tool_calls) {
+            let argsObj: unknown = tc.function.arguments;
+            if (typeof tc.function.arguments === "string") {
+              try {
+                argsObj = JSON.parse(tc.function.arguments);
+              } catch {
+                argsObj = tc.function.arguments;
+              }
+            }
             parts.push(
-              `[Tool call]: ${tc.function.name}(${tc.function.arguments})`
+              JSON.stringify({
+                name: tc.function.name,
+                arguments: argsObj,
+              })
             );
           }
         }
-        if (msg.content) parts.push(`[Assistant]: ${msg.content}`);
         break;
       case "tool":
         parts.push(`[Tool result for ${msg.tool_call_id ?? "tool"}]: ${msg.content ?? ""}`);
@@ -110,7 +121,7 @@ function buildToolBlock(
 export interface DSStreamState {
   content: string;
   thinking: string;
-  /** True when the request included tool definitions — content is buffered instead of streamed */
+  /** True when the request included tool definitions */
   hasTools: boolean;
   /** The DeepSeek response message ID (for parent_message_id chaining) */
   responseMessageId: number | null;
@@ -157,7 +168,7 @@ export function applyStreamEvent(
   if (event.p.includes("/content") && !event.p.includes("thinking")) {
     if (event.o === "APPEND" && typeof event.v === "string") {
       state.content += event.v;
-      // In tool mode, buffer content and emit it (raw JSON) only at the end.
+      // In tool mode, buffer content and emit it only at the end.
       return state.hasTools ? "" : event.v;
     }
   }
@@ -178,6 +189,7 @@ export interface ParsedToolCall {
   id: string;
   name: string;
   arguments: string;
+  leadingText?: string;
 }
 
 /**
@@ -186,17 +198,14 @@ export interface ParsedToolCall {
  * surrounding whitespace and markdown fences.
  */
 export function parseToolCall(content: string): ParsedToolCall | null {
-  let text = content.trim();
-  text = text.replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
-
-  const start = text.indexOf("{");
+  const start = content.indexOf("{");
   if (start === -1) return null;
 
-  const end = text.lastIndexOf("}");
+  const end = content.lastIndexOf("}");
   if (end === -1 || end < start) return null;
 
   try {
-    const obj = JSON.parse(text.slice(start, end + 1)) as {
+    const obj = JSON.parse(content.slice(start, end + 1)) as {
       name?: unknown;
       arguments?: unknown;
       params?: unknown;
@@ -208,10 +217,14 @@ export function parseToolCall(content: string): ParsedToolCall | null {
     const argsStr =
       typeof args === "string" ? args : JSON.stringify(args ?? {});
 
+    let leadingText = content.slice(0, start).trim();
+    leadingText = leadingText.replace(/```(?:json)?\s*$/, "").trim();
+
     return {
       id: `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
       name: obj.name,
       arguments: argsStr,
+      leadingText: leadingText || undefined,
     };
   } catch {
     return null;
