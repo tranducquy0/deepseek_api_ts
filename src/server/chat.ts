@@ -38,12 +38,28 @@ function resolveThinking(body: OpenAIChatRequest, modelId: string): boolean {
 // Tracks DeepSeek sessions across turns, keyed by conversation.
 const sessions = new SessionManager();
 
+function extractExplicitSessionId(body: OpenAIChatRequest): string | undefined {
+  const req = body as unknown as {
+    chat_session_id?: unknown;
+    chatSessionId?: unknown;
+    session_id?: unknown;
+  };
+  for (const field of [req.chat_session_id, req.chatSessionId, req.session_id]) {
+    if (typeof field === "string" && field.trim().length > 0) {
+      return field.trim();
+    }
+  }
+  return undefined;
+}
+
 /**
- * Derive a stable conversation key. Prefer the optional `user` field
- * (the OpenAI convention for a stable identity); otherwise fall back to
- * a hash of the first user message, which never changes across turns.
+ * Derive a stable conversation key. Prefer explicit chat session IDs or
+ * the optional `user` field (the OpenAI convention for a stable identity);
+ * otherwise fall back to a hash of the first user message.
  */
 function conversationKey(body: OpenAIChatRequest): string {
+  const explicit = extractExplicitSessionId(body);
+  if (explicit) return explicit;
   if (typeof body.user === "string" && body.user.length > 0) return body.user;
   const first = body.messages.find((m) => m.role === "user");
   const raw = first?.content ?? "";
@@ -92,9 +108,11 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
     const thinkingEnabled = resolveThinking(body, modelId);
     const stream = body.stream ?? true;
 
+    let convKey: string | null = null;
     try {
-      const convKey = conversationKey(body);
-      const entry = await sessions.getOrCreate(client, convKey);
+      const explicitSessionId = extractExplicitSessionId(body);
+      convKey = conversationKey(body);
+      const entry = await sessions.getOrCreate(client, convKey, explicitSessionId);
       const prompt = buildPrompt(
         forwardMessages(body.messages, entry.lastMessageCount),
         body.tools,
@@ -232,6 +250,9 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
         });
       }
     } catch (err) {
+      if (convKey) {
+        sessions.reset(convKey);
+      }
       const authExpired = err instanceof AuthExpiredError;
       const message = authExpired
         ? "DeepSeek auth expired. Run `ds auth` to re-authenticate."

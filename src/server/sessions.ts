@@ -26,12 +26,17 @@ export class SessionManager {
   /** Return a live session entry or create one via the client. */
   async getOrCreate(
     client: DeepSeekClient,
-    key: string
+    key: string,
+    explicitSessionId?: string
   ): Promise<SessionEntry> {
     const existing = this.get(key);
     if (existing) return existing;
 
-    const sessionId = await client.createSession();
+    const sessionId =
+      explicitSessionId && explicitSessionId.trim().length > 0
+        ? explicitSessionId.trim()
+        : await client.createSession();
+
     const entry: SessionEntry = {
       sessionId,
       parentMessageId: null,
