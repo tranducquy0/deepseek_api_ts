@@ -206,4 +206,17 @@ describe("chatRouter", () => {
     expect(text).toContain('"name":"search"');
     expect(text).toContain('"finish_reason":"tool_calls"');
   });
+
+  it("uses explicit chat_session_id from body when provided", async () => {
+    client.events = STANDARD_EVENTS;
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "Custom session test" }],
+      chat_session_id: "my-custom-session-42",
+      stream: false,
+    });
+    expect(res.status).toBe(200);
+    expect(client.sessionCalls).toBe(0);
+    expect(client.chatCalls[0].chatSessionId).toBe("my-custom-session-42");
+  });
 });

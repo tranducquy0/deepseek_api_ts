@@ -60,4 +60,10 @@ describe("SessionManager", () => {
     sessions.reset("conv-1");
     expect(sessions.get("conv-1")).toBeNull();
   });
+
+  it("uses explicitSessionId when provided instead of calling createSession", async () => {
+    const entry = await sessions.getOrCreate(client, "explicit-123", "explicit-123");
+    expect(entry.sessionId).toBe("explicit-123");
+    expect(client.sessionCalls).toBe(0);
+  });
 });

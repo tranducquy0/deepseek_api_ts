@@ -80,8 +80,35 @@ export class DeepSeekClient {
       const text = await res.text();
       throw new Error(`Failed to create session: ${res.status} ${text}`);
     }
-    const data = (await res.json()) as DSCreateSessionResp;
-    return data.data.id;
+    const raw: unknown = await res.json();
+    const data = raw as {
+      data?: {
+        id?: string;
+        chat_session_id?: string;
+        biz_data?: {
+          id?: string;
+          chat_session_id?: string;
+        };
+      };
+      id?: string;
+      chat_session_id?: string;
+    };
+
+    const sessionId =
+      data?.data?.biz_data?.id ??
+      data?.data?.biz_data?.chat_session_id ??
+      data?.data?.id ??
+      data?.data?.chat_session_id ??
+      data?.id ??
+      data?.chat_session_id;
+
+    if (!sessionId || typeof sessionId !== "string" || !sessionId.trim()) {
+      throw new Error(
+        `Failed to create session: invalid or missing session ID in response (${JSON.stringify(raw)})`
+      );
+    }
+
+    return sessionId.trim();
   }
 
   /**
@@ -95,6 +122,10 @@ export class DeepSeekClient {
     thinkingEnabled: boolean;
     modelType: string;
   }): AsyncGenerator<DSStreamEvent> {
+    if (!params.chatSessionId || typeof params.chatSessionId !== "string" || !params.chatSessionId.trim()) {
+      throw new Error("chatSessionId is required and must be a non-empty string");
+    }
+
     // 1. Get PoW challenge
     const powRes = await this.request("/api/v0/chat/create_pow_challenge", {
       target_path: "/api/v0/chat/completion",
