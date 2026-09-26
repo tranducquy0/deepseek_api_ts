@@ -188,6 +188,18 @@ export class DeepSeekClient {
     const decoder = new TextDecoder();
     let buffer = "";
 
+    const parseLine = (line: string): DSStreamEvent | null => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) return null;
+      const json = trimmed.slice(5).trim();
+      if (!json || json === "[DONE]") return null;
+      try {
+        return JSON.parse(json) as DSStreamEvent;
+      } catch {
+        return null;
+      }
+    };
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -197,16 +209,17 @@ export class DeepSeekClient {
       buffer = lines.pop() ?? "";
 
       for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          const json = line.slice(6).trim();
-          if (!json || json === "[DONE]") continue;
-          try {
-            const event = JSON.parse(json) as DSStreamEvent;
-            yield event;
-          } catch {
-            // skip malformed lines
-          }
-        }
+        const event = parseLine(line);
+        if (event) yield event;
+      }
+    }
+
+    buffer += decoder.decode();
+    if (buffer.length > 0) {
+      const lines = buffer.split("\n");
+      for (const line of lines) {
+        const event = parseLine(line);
+        if (event) yield event;
       }
     }
   }

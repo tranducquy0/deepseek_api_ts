@@ -152,8 +152,6 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
             const chunk = makeChunk(modelId, { content: delta });
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
           }
-
-          if (state.finished) break;
         }
 
         sessions.update(convKey, {
@@ -199,7 +197,6 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
           if (event.p === "response/message_id" && event.v != null) {
             parentId = parseParentMessageId(event.v as string | number);
           }
-          if (state.finished) break;
         }
 
         sessions.update(convKey, {

@@ -197,4 +197,68 @@ describe("DeepSeekClient", () => {
     expect(capturedBody.parent_message_id).toBe(2);
     expect(typeof capturedBody.parent_message_id).toBe("number");
   });
+
+  it("parses trailing buffer data when stream closes without trailing newline", async () => {
+    const salt = "test-salt";
+    const expireAt = 1234567890;
+    const nonce = 42;
+    const prefix = `${salt}_${expireAt}_`;
+    const challenge = deepSeekHash(Buffer.from(`${prefix}${nonce}`)).toString("hex");
+
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string, opts?: any) => {
+      if (url.endsWith("/create_pow_challenge")) {
+        return {
+          ok: true,
+          json: async () => ({
+            salt,
+            expire_at: expireAt,
+            challenge,
+            difficulty: 100000,
+            signature: "sig",
+          }),
+        } as Response;
+      }
+      if (url.endsWith("/completion")) {
+        return {
+          ok: true,
+          body: {
+            getReader: () => {
+              let done = false;
+              return {
+                read: async () => {
+                  if (done) return { done: true, value: undefined };
+                  done = true;
+                  const encoder = new TextEncoder();
+                  // Note: line does not end with \n before stream end
+                  return {
+                    done: false,
+                    value: encoder.encode('data: {"p":"response/content","o":"SET","v":"Trailing line"}'),
+                  };
+                },
+              };
+            },
+          },
+        } as Response;
+      }
+      return { ok: false, status: 404 } as Response;
+    });
+
+    const events = [];
+    for await (const event of client.chatCompletion({
+      chatSessionId: "sess-1",
+      parentMessageId: null,
+      prompt: "Hello",
+      thinkingEnabled: false,
+      modelType: "deepseek_chat",
+    })) {
+      events.push(event);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      p: "response/content",
+      o: "SET",
+      v: "Trailing line",
+    });
+  });
 });

@@ -151,6 +151,35 @@ describe("chatRouter", () => {
     expect(text).toContain("data: [DONE]");
   });
 
+  it("streams responses with SET operations without truncation", async () => {
+    client.events = [
+      { p: "response/message_id", v: 100, response_message_id: 100 },
+      { o: "SET", p: "response/fragments/0/content", v: "How do I check if an object" },
+      { o: "APPEND", p: "response/fragments/0/content", v: " is an instance" },
+      { o: "SET", p: "response/content", v: "How do I check if an object is an instance of a class?" },
+      { p: "response/status", v: "FINISHED" },
+    ];
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "instance test" }],
+      stream: true,
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+
+    // Parse the data lines to re-assemble the content deltas
+    const lines = text.split("\n");
+    let fullContent = "";
+    for (const line of lines) {
+      if (line.startsWith("data: ") && !line.includes("[DONE]")) {
+        const json = JSON.parse(line.slice(6));
+        const delta = json.choices?.[0]?.delta?.content;
+        if (delta) fullContent += delta;
+      }
+    }
+    expect(fullContent).toBe("How do I check if an object is an instance of a class?");
+  });
+
   it("surfaces tool calls in non-streaming responses", async () => {
     client.events = [
       { p: "response/message_id", v: 1, response_message_id: 1 },
