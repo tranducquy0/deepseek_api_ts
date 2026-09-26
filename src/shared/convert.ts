@@ -162,21 +162,31 @@ export function applyStreamEvent(
     return "";
   }
 
-  if (!event.o) return "";
+  // Handle content append/set/replace
+  if (event.p.includes("content") && !event.p.includes("thinking")) {
+    if (typeof event.v === "string") {
+      const isCumulative =
+        (event.o === "SET" || event.o === "REPLACE" || !event.o) &&
+        Boolean(state.content) &&
+        event.v.startsWith(state.content);
 
-  // Handle content append
-  if (event.p.includes("/content") && !event.p.includes("thinking")) {
-    if (event.o === "APPEND" && typeof event.v === "string") {
-      state.content += event.v;
+      const delta = isCumulative ? event.v.slice(state.content.length) : event.v;
+      state.content += delta;
       // In tool mode, buffer content and emit it only at the end.
-      return state.hasTools ? "" : event.v;
+      return state.hasTools ? "" : delta;
     }
   }
 
   // Handle thinking content (we collect it but don't emit as content)
   if (event.p.includes("thinking_content")) {
-    if (event.o === "APPEND" && typeof event.v === "string") {
-      state.thinking += event.v;
+    if (typeof event.v === "string") {
+      const isCumulative =
+        (event.o === "SET" || event.o === "REPLACE" || !event.o) &&
+        Boolean(state.thinking) &&
+        event.v.startsWith(state.thinking);
+
+      const delta = isCumulative ? event.v.slice(state.thinking.length) : event.v;
+      state.thinking += delta;
     }
   }
 

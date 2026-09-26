@@ -93,11 +93,46 @@ describe("applyStreamEvent", () => {
     v,
   });
 
-  it("accumulates content deltas", () => {
+  it("accumulates content deltas for APPEND, SET, REPLACE, and missing operation types", () => {
     const state = createStreamState();
-    expect(applyStreamEvent(state, append("response/fragments/-1/content", "Hel"))).toBe("Hel");
-    expect(applyStreamEvent(state, append("response/fragments/-1/content", "lo"))).toBe("lo");
+    // SET event with initial fragment chunk
+    expect(
+      applyStreamEvent(state, {
+        p: "response/fragments/0/content",
+        o: "SET",
+        v: "Hel",
+      })
+    ).toBe("Hel");
+    expect(state.content).toBe("Hel");
+
+    // APPEND event
+    expect(
+      applyStreamEvent(state, {
+        p: "response/fragments/0/content",
+        o: "APPEND",
+        v: "lo",
+      })
+    ).toBe("lo");
     expect(state.content).toBe("Hello");
+
+    // Cumulative SET event on response/content
+    expect(
+      applyStreamEvent(state, {
+        p: "response/content",
+        o: "SET",
+        v: "Hello world",
+      })
+    ).toBe(" world");
+    expect(state.content).toBe("Hello world");
+
+    // Event with missing operation type
+    expect(
+      applyStreamEvent(state, {
+        p: "response/content",
+        v: "!",
+      })
+    ).toBe("!");
+    expect(state.content).toBe("Hello world!");
   });
 
   it("buffers without streaming content in tool mode", () => {
