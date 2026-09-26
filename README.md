@@ -8,7 +8,8 @@ endpoint — compatible with ChatGPT-style apps, Claude Code, scripts, etc.
 
 - `POST /v1/chat/completions` — streaming (`stream: true`) and non-streaming responses
 - Tool / function calling (`tools`, `tool_choice`, `tool_calls`, `role: "tool"`)
-- Thinking toggle for the reasoning model (`thinking: true`, or use `deepseek-reasoner`)
+- Thinking toggle for the reasoning model (`thinking: true`, or use `deepseek-reasoner`),
+  streamed as OpenAI `reasoning_content`
 - Multi-turn conversation chaining via DeepSeek session `parent_message_id`
 - `GET /v1/models` and a JSON health endpoint
 - PoW solver to satisfy DeepSeek's proof-of-work: official WASM module with a pure-TS
@@ -76,7 +77,7 @@ Body fields:
 | ------------------ | ----------------------------- | -------------------------------------------------- |
 | `model`            | `string`                      | `deepseek-chat` (V3) or `deepseek-reasoner` (R1)   |
 | `messages`         | `OpenAIMessage[]`             | roles: `system`, `user`, `assistant`, `tool`       |
-| `stream`           | `boolean`                     | SSE by default                                     |
+| `stream`           | `boolean`                     | SSE when `true`; JSON by default (as per OpenAI)      |
 | `thinking`         | `boolean`                     | Force reasoning on/off (default: on for reasoner)  |
 | `tools`            | `OpenAITool[]`                | Function calling                                   |
 | `tool_choice`      | `string \| object`            | `"auto"`, `"none"`, `"required"`, or `{...}`       |
@@ -128,7 +129,7 @@ npm run dev     # tsx hot-run src/cli.ts
 
 ## Roadmap
 
-- Stream `reasoning_content` for `deepseek-reasoner`
 - Abort upstream DeepSeek stream when the client disconnects
 - Account info endpoint and `ds status` CLI command
 - Configurable bind host for LAN access
+- Report real `usage` token counts (currently stubbed as `0`)

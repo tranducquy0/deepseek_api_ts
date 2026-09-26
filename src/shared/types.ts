@@ -19,6 +19,8 @@ export interface Cookie {
 export interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string | null;
+  /** Reasoning text from the `deepseek-reasoner` model. */
+  reasoning_content?: string | null;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
 }

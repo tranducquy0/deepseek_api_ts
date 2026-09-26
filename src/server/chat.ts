@@ -106,7 +106,9 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
     const modelId = body.model ?? "deepseek-chat";
     const dsModelType = mapModel(modelId);
     const thinkingEnabled = resolveThinking(body, modelId);
-    const stream = body.stream ?? true;
+    // Per the OpenAI spec the default is a single JSON response; clients that
+    // omit `stream` cannot parse an SSE body.
+    const stream = body.stream ?? false;
 
     let convKey: string | null = null;
     try {
@@ -148,8 +150,11 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
             parentId = parseParentMessageId(event.v as string | number);
           }
 
-          if (delta) {
-            const chunk = makeChunk(modelId, { content: delta });
+          if (delta.content || delta.reasoning) {
+            const chunk = makeChunk(modelId, {
+              ...(delta.content ? { content: delta.content } : {}),
+              ...(delta.reasoning ? { reasoning_content: delta.reasoning } : {}),
+            });
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
           }
         }
@@ -208,11 +213,13 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
         });
 
         const toolCall = extractToolCall(state);
+        const reasoning = state.thinking || undefined;
         const message: OpenAIMessage =
           toolCall
             ? {
                 role: "assistant",
                 content: toolCall.leadingText || null,
+                ...(reasoning ? { reasoning_content: reasoning } : {}),
                 tool_calls: [
                   {
                     id: toolCall.id,
@@ -224,7 +231,11 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
                   } satisfies OpenAIToolCall,
                 ],
               }
-            : { role: "assistant", content: state.content };
+            : {
+                role: "assistant",
+                content: state.content,
+                ...(reasoning ? { reasoning_content: reasoning } : {}),
+              };
         const finishReason = toolCall ? "tool_calls" : "stop";
 
         res.json({

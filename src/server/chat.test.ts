@@ -236,6 +236,94 @@ describe("chatRouter", () => {
     expect(text).toContain('"finish_reason":"tool_calls"');
   });
 
+  it("replays a captured DeepSeek stream without dropping tokens", async () => {
+    // Verbatim shape of a real chat.deepseek.com completion: the path is
+    // declared once, then ~400 bare {"v":"…"} frames inherit it.
+    client.events = [
+      { request_message_id: 1, response_message_id: 2 } as DSStreamEvent,
+      {
+        v: {
+          response: {
+            message_id: 2,
+            fragments: [{ id: 2, type: "RESPONSE", content: "#" }],
+          },
+        },
+      },
+      { o: "APPEND", p: "response/fragments/-1/content", v: " Checking" },
+      { v: " if" },
+      { v: " a" },
+      { v: " Python" },
+      { o: "SET", p: "response/fragments/-1/elapsed_secs", v: 0.42 },
+      { p: "response", o: "BATCH", v: [{ p: "accumulated_token_usage", v: 12 }] },
+      { o: "SET", p: "response/status", v: "FINISHED" },
+    ];
+
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "stream me" }],
+      stream: true,
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+
+    let streamed = "";
+    for (const line of text.split("\n")) {
+      if (line.startsWith("data: ") && !line.includes("[DONE]")) {
+        streamed += JSON.parse(line.slice(6)).choices?.[0]?.delta?.content ?? "";
+      }
+    }
+    expect(streamed).toBe("# Checking if a Python");
+  });
+
+  it("streams reasoning_content separately from content", async () => {
+    client.events = [
+      { v: { response: { fragments: [{ id: 2, type: "THINK", content: "We" }] } } },
+      { o: "APPEND", p: "response/fragments/-1/content", v: " need" },
+      { v: " this" },
+      {
+        p: "response/fragments",
+        o: "APPEND",
+        v: [{ id: 3, type: "RESPONSE", content: "42" }],
+      },
+      { v: "." },
+    ];
+
+    const res = await post({
+      model: "deepseek-reasoner",
+      messages: [{ role: "user", content: "reason please" }],
+      stream: true,
+    });
+    const text = await res.text();
+
+    let content = "";
+    let reasoning = "";
+    for (const line of text.split("\n")) {
+      if (line.startsWith("data: ") && !line.includes("[DONE]")) {
+        const delta = JSON.parse(line.slice(6)).choices?.[0]?.delta ?? {};
+        content += delta.content ?? "";
+        reasoning += delta.reasoning_content ?? "";
+      }
+    }
+    expect(reasoning).toBe("We need this");
+    expect(content).toBe("42.");
+  });
+
+  it("defaults to a non-streaming JSON response when stream is omitted", async () => {
+    client.events = STANDARD_EVENTS;
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "no stream field" }],
+    } as OpenAIChatRequest);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const json = (await res.json()) as {
+      object: string;
+      choices: { message: { content: string } }[];
+    };
+    expect(json.object).toBe("chat.completion");
+    expect(json.choices[0].message.content).toBe("Hello there");
+  });
+
   it("uses explicit chat_session_id from body when provided", async () => {
     client.events = STANDARD_EVENTS;
     const res = await post({

@@ -118,6 +118,13 @@ function buildToolBlock(
 
 // ── SSE → OpenAI chunk converter ────────────────────────────────────
 
+/** A DeepSeek response fragment (one THINK / RESPONSE / SEARCH segment). */
+export interface DSFragment {
+  id?: number;
+  type?: string;
+  content?: string;
+}
+
 export interface DSStreamState {
   content: string;
   thinking: string;
@@ -126,7 +133,35 @@ export interface DSStreamState {
   /** The DeepSeek response message ID (for parent_message_id chaining) */
   responseMessageId: number | null;
   finished: boolean;
+  /**
+   * Last explicitly declared patch path. DeepSeek's stream is a JSON patch:
+   * `p`/`o` are declared once and every following bare `{"v":…}` frame reuses
+   * them, so the path has to be remembered across events.
+   */
+  path: string | null;
+  /** Last explicitly declared operation ("APPEND" | "SET" | "REPLACE" | …). */
+  op: string | null;
+  /** Fragments announced so far; the `fragments/-1` path resolves to the last. */
+  fragments: DSFragment[];
+  /** True when the active fragment is a reasoning (THINK) fragment. */
+  reasoning: boolean;
+  /** The opening snapshot has already been consumed. */
+  seeded: boolean;
 }
+
+/** Text produced by a single stream event. */
+export interface StreamDelta {
+  content: string;
+  reasoning: string;
+}
+
+const NO_DELTA: StreamDelta = { content: "", reasoning: "" };
+
+/** `response/fragments/<index>/content` — where token deltas arrive. */
+const FRAGMENT_CONTENT_PATH = /^response\/fragments\/(-?\d+)\/content$/;
+
+/** Path used for a fragment's text once the fragment has been announced. */
+const CURRENT_FRAGMENT_CONTENT = "response/fragments/-1/content";
 
 /**
  * Initialize a new stream state.
@@ -138,59 +173,192 @@ export function createStreamState(hasTools = false): DSStreamState {
     hasTools,
     responseMessageId: null,
     finished: false,
+    path: null,
+    op: null,
+    fragments: [],
+    reasoning: false,
+    seeded: false,
   };
 }
 
 /**
  * Apply a DeepSeek stream event to the state.
- * Returns the delta content (if any) for this event.
+ * Returns the text this event added (empty strings when it carried none).
  */
 export function applyStreamEvent(
   state: DSStreamState,
   event: DSStreamEvent
-): string {
+): StreamDelta {
   // Capture response message ID for multi-turn chaining
   if (event.response_message_id != null) {
     state.responseMessageId = event.response_message_id;
   }
 
-  if (!event.p) return "";
-
-  // Check for finish (status events carry no operation field)
-  if (event.p === "response/status" && event.v === "FINISHED") {
-    state.finished = true;
-    return "";
+  // Opening snapshot: {"v":{"response":{…,"fragments":[{type,content}]}}}
+  if (
+    !state.seeded &&
+    !event.p &&
+    state.content === "" &&
+    state.thinking === "" &&
+    isSnapshot(event.v)
+  ) {
+    state.seeded = true;
+    return seedFromSnapshot(state, event.v as { response?: { fragments?: unknown } });
   }
 
-  // Handle content append/set/replace
-  if (event.p.includes("content") && !event.p.includes("thinking")) {
-    if (typeof event.v === "string") {
-      const isCumulative =
-        (event.o === "SET" || event.o === "REPLACE" || !event.o) &&
-        Boolean(state.content) &&
-        event.v.startsWith(state.content);
+  // An explicit `p` re-anchors the patch; bare frames inherit the last one.
+  if (typeof event.p === "string" && event.p.length > 0) {
+    state.path = event.p;
+    state.op = typeof event.o === "string" ? event.o : null;
+  }
+  const path = state.path;
+  if (!path) return NO_DELTA;
+  const op = state.op ?? undefined;
 
-      const delta = isCumulative ? event.v.slice(state.content.length) : event.v;
-      state.content += delta;
-      // In tool mode, buffer content and emit it only at the end.
-      return state.hasTools ? "" : delta;
+  // Batch: {"p":"response","o":"BATCH","v":[{"p":"…/…","v":…}, …]}
+  if (event.o === "BATCH" && Array.isArray(event.v)) {
+    for (const sub of event.v as DSStreamEvent[]) {
+      if (sub && typeof sub === "object" && typeof sub.p === "string") {
+        applyStreamEvent(state, {
+          p: `${path}/${sub.p}`,
+          o: sub.o,
+          v: sub.v,
+        });
+      }
+    }
+    return NO_DELTA;
+  }
+
+  if (path === "response/status") {
+    if (event.v === "FINISHED") state.finished = true;
+    return NO_DELTA;
+  }
+
+  if (path === "response/fragments") {
+    return applyFragmentList(state, event);
+  }
+
+  const fragmentMatch = FRAGMENT_CONTENT_PATH.exec(path);
+  if (fragmentMatch) {
+    state.reasoning = fragmentAt(state, Number(fragmentMatch[1]))?.type === "THINK";
+    return applyTextDelta(state, event.v, op, state.reasoning);
+  }
+
+  // Legacy/alternate path for reasoning text.
+  if (path.endsWith("/thinking_content")) {
+    state.reasoning = true;
+    return applyTextDelta(state, event.v, op, true);
+  }
+
+  // Whole-message content path.
+  if (path === "response/content") {
+    state.reasoning = false;
+    return applyTextDelta(state, event.v, op, false);
+  }
+
+  // Anything else (elapsed_secs, accumulated_token_usage, title, …).
+  return NO_DELTA;
+}
+
+/** True for the full response snapshot frame that opens the stream. */
+function isSnapshot(v: unknown): v is { response?: { fragments?: unknown } } {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    !Array.isArray(v) &&
+    typeof (v as { response?: unknown }).response === "object"
+  );
+}
+
+/**
+ * Seed buffers from the opening snapshot. Its first fragment already holds the
+ * opening token(s), which DeepSeek never re-sends as deltas.
+ */
+function seedFromSnapshot(
+  state: DSStreamState,
+  snapshot: { response?: { fragments?: unknown } }
+): StreamDelta {
+  const raw = snapshot.response?.fragments;
+  if (!Array.isArray(raw) || raw.length === 0) return NO_DELTA;
+
+  state.fragments = (raw as DSFragment[]).slice();
+  const last = state.fragments[state.fragments.length - 1];
+  state.reasoning = last?.type === "THINK";
+  return applyTextDelta(state, last?.content, state.op ?? undefined, state.reasoning);
+}
+
+/**
+ * Handle `response/fragments` announcements. Each new fragment arrives with the
+ * text produced so far — those tokens are never streamed separately, so they
+ * are emitted here instead of being lost.
+ */
+function applyFragmentList(state: DSStreamState, event: DSStreamEvent): StreamDelta {
+  const incoming = Array.isArray(event.v) ? (event.v as DSFragment[]) : [];
+
+  // A SET carries the full list, i.e. text that was already streamed.
+  if (event.o === "SET") {
+    state.fragments = incoming.slice();
+    return NO_DELTA;
+  }
+
+  let content = "";
+  let reasoning = "";
+  for (const fragment of incoming) {
+    state.fragments.push(fragment);
+    const text = typeof fragment?.content === "string" ? fragment.content : "";
+    if (!text) continue;
+    if (fragment?.type === "THINK") {
+      state.thinking += text;
+      reasoning += text;
+    } else {
+      state.content += text;
+      content += text;
     }
   }
+  state.reasoning =
+    state.fragments[state.fragments.length - 1]?.type === "THINK";
 
-  // Handle thinking content (we collect it but don't emit as content)
-  if (event.p.includes("thinking_content")) {
-    if (typeof event.v === "string") {
-      const isCumulative =
-        (event.o === "SET" || event.o === "REPLACE" || !event.o) &&
-        Boolean(state.thinking) &&
-        event.v.startsWith(state.thinking);
+  // Bare frames that follow target the new fragment's text.
+  state.path = CURRENT_FRAGMENT_CONTENT;
+  state.op = "APPEND";
 
-      const delta = isCumulative ? event.v.slice(state.thinking.length) : event.v;
-      state.thinking += delta;
-    }
+  return { content: state.hasTools ? "" : content, reasoning };
+}
+
+/** Resolve a fragment index (negative counts from the end) against the list. */
+function fragmentAt(state: DSStreamState, index: number): DSFragment | undefined {
+  if (index < 0) return state.fragments[state.fragments.length + index];
+  return state.fragments[index];
+}
+
+/**
+ * Append `v` to a buffer. APPEND frames carry new text only; SET/REPLACE
+ * frames (and frames with no operation) may repeat everything seen so far.
+ */
+function accumulate(buffer: string, op: string | undefined, v: string): string {
+  if (op === "APPEND") return v;
+  if (buffer.length > 0 && v.startsWith(buffer)) return v.slice(buffer.length);
+  return v;
+}
+
+function applyTextDelta(
+  state: DSStreamState,
+  v: unknown,
+  op: string | undefined,
+  reasoning: boolean
+): StreamDelta {
+  if (typeof v !== "string" || v.length === 0) return NO_DELTA;
+
+  if (reasoning) {
+    const delta = accumulate(state.thinking, op, v);
+    state.thinking += delta;
+    return { content: "", reasoning: delta };
   }
 
-  return "";
+  const delta = accumulate(state.content, op, v);
+  state.content += delta;
+  // In tool mode, buffer content and emit it only at the end.
+  return { content: state.hasTools ? "" : delta, reasoning: "" };
 }
 
 // ── Tool call parsing ───────────────────────────────────────────────
