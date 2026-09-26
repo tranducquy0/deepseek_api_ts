@@ -85,22 +85,40 @@ export class DeepSeekClient {
       data?: {
         id?: string;
         chat_session_id?: string;
+        chat_session?: {
+          id?: string;
+          chat_session_id?: string;
+        };
         biz_data?: {
           id?: string;
           chat_session_id?: string;
+          chat_session?: {
+            id?: string;
+            chat_session_id?: string;
+          };
         };
       };
       id?: string;
       chat_session_id?: string;
+      chat_session?: {
+        id?: string;
+        chat_session_id?: string;
+      };
     };
 
     const sessionId =
+      data?.data?.biz_data?.chat_session?.id ??
+      data?.data?.biz_data?.chat_session?.chat_session_id ??
       data?.data?.biz_data?.id ??
       data?.data?.biz_data?.chat_session_id ??
+      data?.data?.chat_session?.id ??
+      data?.data?.chat_session?.chat_session_id ??
       data?.data?.id ??
       data?.data?.chat_session_id ??
       data?.id ??
-      data?.chat_session_id;
+      data?.chat_session_id ??
+      data?.chat_session?.id ??
+      data?.chat_session?.chat_session_id;
 
     if (!sessionId || typeof sessionId !== "string" || !sessionId.trim()) {
       throw new Error(
