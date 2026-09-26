@@ -8,7 +8,7 @@ import type { DeepSeekClient } from "../deepseek/client.js";
 
 interface ChatCall {
   chatSessionId: string;
-  parentMessageId: string | null;
+  parentMessageId: number | string | null;
   prompt: string;
   modelType: string;
 }
@@ -25,7 +25,7 @@ class FakeClient {
 
   async *chatCompletion(params: {
     chatSessionId: string;
-    parentMessageId: string | null;
+    parentMessageId: number | string | null;
     prompt: string;
     modelType: string;
   }): AsyncGenerator<DSStreamEvent> {
@@ -114,7 +114,7 @@ describe("chatRouter", () => {
     expect(client.chatCalls).toHaveLength(2);
     expect(client.chatCalls[1].chatSessionId).toBe(client.chatCalls[0].chatSessionId);
     // Parent id persisted from turn one's response_message_id
-    expect(client.chatCalls[1].parentMessageId).toBe("12345");
+    expect(client.chatCalls[1].parentMessageId).toBe(12345);
     // Previous assistant message is skipped when forwarded > 0 because parentMessageId holds it
     expect(client.chatCalls[1].prompt).not.toContain("Chain me please");
     expect(client.chatCalls[1].prompt).not.toContain("[Assistant]: Hello there");

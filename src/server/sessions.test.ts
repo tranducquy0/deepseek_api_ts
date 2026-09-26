@@ -29,11 +29,11 @@ describe("SessionManager", () => {
 
   it("reuses the live session and persists chaining state", async () => {
     const first = await sessions.getOrCreate(client, "conv-1");
-    sessions.update("conv-1", { parentMessageId: "msg-1", messageCount: 2 });
+    sessions.update("conv-1", { parentMessageId: "12345", messageCount: 2 });
 
     const second = await sessions.getOrCreate(client, "conv-1");
     expect(second.sessionId).toBe(first.sessionId);
-    expect(second.parentMessageId).toBe("msg-1");
+    expect(second.parentMessageId).toBe(12345);
     expect(second.lastMessageCount).toBe(2);
     expect(client.sessionCalls).toBe(1);
   });

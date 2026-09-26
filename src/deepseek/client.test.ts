@@ -1,5 +1,28 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { DeepSeekClient } from "./client.js";
+import { DeepSeekClient, parseParentMessageId } from "./client.js";
+import { deepSeekHash } from "./pow.js";
+
+describe("parseParentMessageId", () => {
+  it("converts string digits to numbers", () => {
+    expect(parseParentMessageId("2")).toBe(2);
+    expect(parseParentMessageId("12345")).toBe(12345);
+    expect(parseParentMessageId(" 42 ")).toBe(42);
+  });
+
+  it("handles numbers directly", () => {
+    expect(parseParentMessageId(2)).toBe(2);
+    expect(parseParentMessageId(12345)).toBe(12345);
+    expect(parseParentMessageId(0)).toBe(0);
+  });
+
+  it("returns null for null, undefined, empty, or non-numeric strings", () => {
+    expect(parseParentMessageId(null)).toBeNull();
+    expect(parseParentMessageId(undefined)).toBeNull();
+    expect(parseParentMessageId("")).toBeNull();
+    expect(parseParentMessageId("   ")).toBeNull();
+    expect(parseParentMessageId("invalid")).toBeNull();
+  });
+});
 
 describe("DeepSeekClient", () => {
   const auth = { token: "fake-token", cookies: [] };
@@ -111,5 +134,67 @@ describe("DeepSeekClient", () => {
     await expect(generator.next()).rejects.toThrow(
       "chatSessionId is required and must be a non-empty string"
     );
+  });
+
+  it("converts string parentMessageId to numeric parent_message_id in request body", async () => {
+    let capturedBody: any;
+    const salt = "test-salt";
+    const expireAt = 1234567890;
+    const nonce = 42;
+    const prefix = `${salt}_${expireAt}_`;
+    const challenge = deepSeekHash(Buffer.from(`${prefix}${nonce}`)).toString("hex");
+
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string, opts?: any) => {
+      if (url.endsWith("/create_pow_challenge")) {
+        return {
+          ok: true,
+          json: async () => ({
+            salt,
+            expire_at: expireAt,
+            challenge,
+            difficulty: 100000,
+            signature: "sig",
+          }),
+        } as Response;
+      }
+      if (url.endsWith("/completion")) {
+        capturedBody = JSON.parse(opts.body);
+        return {
+          ok: true,
+          body: {
+            getReader: () => {
+              let done = false;
+              return {
+                read: async () => {
+                  if (done) return { done: true, value: undefined };
+                  done = true;
+                  const encoder = new TextEncoder();
+                  return {
+                    done: false,
+                    value: encoder.encode('data: {"p":"response/status","v":"FINISHED"}\n\n'),
+                  };
+                },
+              };
+            },
+          },
+        } as Response;
+      }
+      return { ok: false, status: 404 } as Response;
+    });
+
+    const events = [];
+    for await (const event of client.chatCompletion({
+      chatSessionId: "sess-1",
+      parentMessageId: "2",
+      prompt: "Hello",
+      thinkingEnabled: false,
+      modelType: "deepseek_chat",
+    })) {
+      events.push(event);
+    }
+
+    expect(capturedBody).toBeDefined();
+    expect(capturedBody.parent_message_id).toBe(2);
+    expect(typeof capturedBody.parent_message_id).toBe("number");
   });
 });
