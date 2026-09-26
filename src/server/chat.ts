@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { Router, type Request, type Response } from "express";
-import { DeepSeekClient, AuthExpiredError } from "../deepseek/client.js";
+import { DeepSeekClient, AuthExpiredError, parseParentMessageId } from "../deepseek/client.js";
 import type {
   AuthData,
   OpenAIChatRequest,
@@ -119,7 +119,7 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
         body.tool_choice
       );
       const hasTools = !!body.tools?.length;
-      let parentId: string | null = entry.parentMessageId;
+      let parentId: number | null = entry.parentMessageId;
 
       if (stream) {
         // ── Streaming response ──────────────────────────────
@@ -144,8 +144,8 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
           const delta = applyStreamEvent(state, event);
 
           // Capture parent_message_id for subsequent turns
-          if (event.p === "response/message_id" && event.v) {
-            parentId = String(event.v);
+          if (event.p === "response/message_id" && event.v != null) {
+            parentId = parseParentMessageId(event.v as string | number);
           }
 
           if (delta) {
@@ -159,7 +159,7 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
         sessions.update(convKey, {
           parentMessageId:
             state.responseMessageId != null
-              ? String(state.responseMessageId)
+              ? state.responseMessageId
               : parentId,
           messageCount: body.messages.length,
         });
@@ -196,8 +196,8 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
           modelType: dsModelType,
         })) {
           applyStreamEvent(state, event);
-          if (event.p === "response/message_id" && event.v) {
-            parentId = String(event.v);
+          if (event.p === "response/message_id" && event.v != null) {
+            parentId = parseParentMessageId(event.v as string | number);
           }
           if (state.finished) break;
         }
@@ -205,7 +205,7 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
         sessions.update(convKey, {
           parentMessageId:
             state.responseMessageId != null
-              ? String(state.responseMessageId)
+              ? state.responseMessageId
               : parentId,
           messageCount: body.messages.length,
         });

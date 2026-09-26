@@ -1,8 +1,9 @@
 import type { DeepSeekClient } from "../deepseek/client.js";
+import { parseParentMessageId } from "../deepseek/client.js";
 
 export interface SessionEntry {
   sessionId: string;
-  parentMessageId: string | null;
+  parentMessageId: number | null;
   lastMessageCount: number;
   updatedAt: number;
 }
@@ -61,11 +62,11 @@ export class SessionManager {
   /** Persist chaining/forwarding state after a completed turn. */
   update(
     key: string,
-    state: { parentMessageId: string | null; messageCount: number }
+    state: { parentMessageId: number | string | null; messageCount: number }
   ): void {
     const entry = this.entries.get(key);
     if (!entry) return;
-    entry.parentMessageId = state.parentMessageId;
+    entry.parentMessageId = parseParentMessageId(state.parentMessageId);
     entry.lastMessageCount = state.messageCount;
     entry.updatedAt = Date.now();
   }

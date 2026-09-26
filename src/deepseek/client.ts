@@ -135,7 +135,7 @@ export class DeepSeekClient {
    */
   async *chatCompletion(params: {
     chatSessionId: string;
-    parentMessageId: string | null;
+    parentMessageId: number | string | null;
     prompt: string;
     thinkingEnabled: boolean;
     modelType: string;
@@ -162,7 +162,7 @@ export class DeepSeekClient {
     // 3. Send chat completion
     const body = {
       chat_session_id: params.chatSessionId,
-      parent_message_id: params.parentMessageId,
+      parent_message_id: parseParentMessageId(params.parentMessageId),
       prompt: params.prompt,
       ref_file_ids: [],
       thinking_enabled: params.thinkingEnabled,
@@ -223,4 +223,18 @@ export class AuthExpiredError extends Error {
     super(msg);
     this.name = "AuthExpiredError";
   }
+}
+
+export function parseParentMessageId(id: number | string | null | undefined): number | null {
+  if (id == null) return null;
+  if (typeof id === "number") {
+    return Number.isFinite(id) ? Math.floor(id) : null;
+  }
+  if (typeof id === "string") {
+    const trimmed = id.trim();
+    if (!trimmed) return null;
+    const parsed = parseInt(trimmed, 10);
+    return isNaN(parsed) ? null : parsed;
+  }
+  return null;
 }

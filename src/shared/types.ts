@@ -117,7 +117,7 @@ export interface DSCreateSessionResp {
 
 export interface DSChatCompletionReq {
   chat_session_id: string;
-  parent_message_id: string | null;
+  parent_message_id: number | null;
   prompt: string;
   ref_file_ids: string[];
   thinking_enabled: boolean;
