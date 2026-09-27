@@ -324,6 +324,236 @@ describe("chatRouter", () => {
     expect(json.choices[0].message.content).toBe("Hello there");
   });
 
+  it("returns a loud 502 when the model emits an unparseable tool call", async () => {
+    client.events = [
+      { o: "APPEND", p: "response/fragments/-1/content", v: '{"name":"search","arguments":' },
+      { p: "response/status", v: "FINISHED" },
+    ];
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "search please" }],
+      tools: [{ type: "function", function: { name: "search", parameters: {} } }],
+      stream: false,
+    });
+    // A clean 200 + finish_reason "stop" here would let an agent loop record a
+    // completed step that never happened.
+    expect(res.status).toBe(502);
+    const json = (await res.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(json.error.code).toBe("tool_call_parse_failed");
+    expect(json.error.message).toContain("unparseable tool call");
+  });
+
+  it("emits an SSE error frame instead of [DONE] on a bad tool call", async () => {
+    client.events = [
+      { o: "APPEND", p: "response/fragments/-1/content", v: '{"name":"search","arguments":' },
+      { p: "response/status", v: "FINISHED" },
+    ];
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "search please" }],
+      tools: [{ type: "function", function: { name: "search", parameters: {} } }],
+      stream: true,
+    });
+    const text = await res.text();
+    expect(text).toContain('"code":"tool_call_parse_failed"');
+    // The SDK raises APIError on an error frame; [DONE] would imply success.
+    expect(text).not.toContain("[DONE]");
+    // No terminal finish_reason either — the turn never completed.
+    const terminal = text
+      .split("\n")
+      .filter((l) => l.startsWith("data: ") && !l.includes("[DONE]"))
+      .map((l) => JSON.parse(l.slice(6)).choices?.[0]?.finish_reason)
+      .filter((r) => r !== null && r !== undefined);
+    expect(terminal).toEqual([]);
+  });
+
+  it("returns several tool calls from one turn, indexed in order", async () => {
+    client.events = [
+      {
+        o: "APPEND",
+        p: "response/fragments/-1/content",
+        v: '{"name":"read","arguments":{"p":"a"}}\n{"name":"read","arguments":{"p":"b"}}',
+      },
+      { p: "response/status", v: "FINISHED" },
+    ];
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "read both" }],
+      tools: [{ type: "function", function: { name: "read", parameters: {} } }],
+      stream: false,
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      choices: {
+        finish_reason: string;
+        message: { tool_calls: { function: { name: string; arguments: string } }[] };
+      }[];
+    };
+    expect(json.choices[0].finish_reason).toBe("tool_calls");
+    expect(json.choices[0].message.tool_calls.map((c) => c.function.arguments)).toEqual([
+      '{"p":"a"}',
+      '{"p":"b"}',
+    ]);
+  });
+
+  it("sets finish_reason exactly once per stream", async () => {
+    client.events = [
+      {
+        o: "APPEND",
+        p: "response/fragments/-1/content",
+        v: '{"name":"search","arguments":{"q":"x"}}',
+      },
+      { p: "response/status", v: "FINISHED" },
+    ];
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "one tool" }],
+      tools: [{ type: "function", function: { name: "search", parameters: {} } }],
+      stream: true,
+    });
+    const text = await res.text();
+    const reasons = text
+      .split("\n")
+      .filter((l) => l.startsWith("data: ") && !l.includes("[DONE]"))
+      .map((l) => JSON.parse(l.slice(6)).choices[0].finish_reason)
+      .filter((r) => r !== null);
+    expect(reasons).toEqual(["tool_calls"]);
+  });
+
+  it("reuses one completion id across every chunk", async () => {
+    client.events = [
+      { o: "APPEND", p: "response/fragments/-1/content", v: "Hello" },
+      { v: " there" },
+      { p: "response/status", v: "FINISHED" },
+    ];
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "stable id" }],
+      stream: true,
+    });
+    const text = await res.text();
+    const ids = new Set(
+      text
+        .split("\n")
+        .filter((l) => l.startsWith("data: ") && !l.includes("[DONE]"))
+        .map((l) => JSON.parse(l.slice(6)).id)
+    );
+    expect(ids.size).toBe(1);
+  });
+
+  it("reports DeepSeek token usage and a usage chunk on request", async () => {
+    client.events = [
+      { o: "APPEND", p: "response/fragments/-1/content", v: "hi" },
+      {
+        p: "response",
+        o: "BATCH",
+        v: [{ p: "accumulated_token_usage", v: 465 }],
+      },
+      { p: "response/status", v: "FINISHED" },
+    ];
+
+    const streamed = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "usage please" }],
+      stream: true,
+      stream_options: { include_usage: true },
+    } as OpenAIChatRequest);
+    const usageChunk = (await streamed.text())
+      .split("\n")
+      .filter((l) => l.startsWith("data: ") && !l.includes("[DONE]"))
+      .map((l) => JSON.parse(l.slice(6)))
+      .find((c) => c.usage);
+    expect(usageChunk?.choices).toEqual([]);
+    expect(usageChunk?.usage.total_tokens).toBe(465);
+
+    const json = (await (
+      await post({
+        model: "deepseek-chat",
+        messages: [{ role: "user", content: "usage please" }],
+        stream: false,
+      } as OpenAIChatRequest)
+    ).json()) as { usage: { total_tokens: number } };
+    expect(json.usage.total_tokens).toBe(465);
+  });
+
+  it("reports per-request usage, not DeepSeek's session-cumulative total", async () => {
+    const withUsage = (total: number): DSStreamEvent[] => [
+      { o: "APPEND", p: "response/fragments/-1/content", v: "ok" },
+      { p: "response", o: "BATCH", v: [{ p: "accumulated_token_usage", v: total }] },
+      { p: "response/status", v: "FINISHED" },
+    ];
+    const ask = (content: string) =>
+      post({
+        model: "deepseek-chat",
+        messages: [{ role: "user", content }],
+        user: "usage-conv",
+        stream: false,
+      });
+
+    client.events = withUsage(300);
+    const first = (await (await ask("usage turn one")).json()) as {
+      usage: { total_tokens: number };
+    };
+    client.events = withUsage(593);
+    const second = (await (await ask("usage turn two")).json()) as {
+      usage: { total_tokens: number };
+    };
+
+    expect(first.usage.total_tokens).toBe(300);
+    // DeepSeek accumulates across the session; each turn reports its own cost.
+    expect(second.usage.total_tokens).toBe(293);
+  });
+
+  it("forwards multimodal content parts as real prompt text", async () => {
+    client.events = STANDARD_EVENTS;
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Summarise the repo." },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AAA" } },
+          ],
+        },
+      ],
+      stream: false,
+    } as unknown as OpenAIChatRequest);
+
+    expect(res.status).toBe(200);
+    const prompt = client.chatCalls[0].prompt;
+    // The bug this guards: an array joined into a string became "[object Object]",
+    // leaving the model with a tool block and no task.
+    expect(prompt).toContain("Summarise the repo.");
+    expect(prompt).not.toContain("[object Object]");
+    expect(prompt).toContain("image_url omitted");
+  });
+
+  it("keeps one conversation when content arrives as parts then as a string", async () => {
+    client.events = STANDARD_EVENTS;
+    await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: [{ type: "text", text: "same task" }] }],
+      stream: false,
+    } as unknown as OpenAIChatRequest);
+    await post({
+      model: "deepseek-chat",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "same task" }] },
+        { role: "assistant", content: "Hello there" },
+        { role: "user", content: [{ type: "text", text: "and again" }] },
+      ],
+      stream: false,
+    } as unknown as OpenAIChatRequest);
+
+    // A key that changed shape would fork a second DeepSeek session and lose
+    // the conversation.
+    expect(client.sessionCalls).toBe(1);
+    expect(client.chatCalls[1].prompt).toContain("and again");
+  });
+
   it("uses explicit chat_session_id from body when provided", async () => {
     client.events = STANDARD_EVENTS;
     const res = await post({

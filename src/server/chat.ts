@@ -3,6 +3,7 @@ import { Router, type Request, type Response } from "express";
 import { DeepSeekClient, AuthExpiredError, parseParentMessageId } from "../deepseek/client.js";
 import type {
   AuthData,
+  CompletionUsage,
   OpenAIChatRequest,
   OpenAIMessage,
   OpenAIToolCall,
@@ -10,11 +11,14 @@ import type {
 import { SessionManager } from "./sessions.js";
 import {
   buildPrompt,
+  contentToText,
   createStreamState,
   applyStreamEvent,
+  extractToolCalls,
   makeChunk,
   makeToolCallChunk,
-  extractToolCall,
+  makeUsageChunk,
+  newCompletionMeta,
   mapModel,
 } from "../shared/convert.js";
 
@@ -33,6 +37,26 @@ function resolveThinking(body: OpenAIChatRequest, modelId: string): boolean {
   }
   if (typeof v === "number") return v !== 0;
   return modelId === "deepseek-reasoner";
+}
+
+/** OpenAI-shaped error payload used for both HTTP and SSE failures. */
+function errorBody(message: string, type: string, code?: string) {
+  return { error: { message, type, ...(code ? { code } : {}) } };
+}
+
+/**
+ * Per-request usage for a turn. DeepSeek reports tokens accumulated over the
+ * whole chat session, so the total is diffed against the previous turn;
+ * otherwise a long agent run re-reports every earlier turn.
+ */
+function requestUsage(
+  sessions: SessionManager,
+  convKey: string,
+  usage: CompletionUsage | null
+): CompletionUsage | null {
+  if (!usage) return null;
+  const total = sessions.usageDelta(convKey, usage.total_tokens);
+  return total == null ? null : { ...usage, total_tokens: total };
 }
 
 // Tracks DeepSeek sessions across turns, keyed by conversation.
@@ -62,10 +86,9 @@ function conversationKey(body: OpenAIChatRequest): string {
   if (explicit) return explicit;
   if (typeof body.user === "string" && body.user.length > 0) return body.user;
   const first = body.messages.find((m) => m.role === "user");
-  const raw = first?.content ?? "";
-  const seed = Array.isArray(raw)
-    ? raw.map((p) => (typeof p === "string" ? p : p.text ?? "")).join("")
-    : raw;
+  // contentToText keeps the key stable whether the client sends a plain string
+  // or multimodal content parts, so a turn cannot fork into a new session.
+  const seed = contentToText(first?.content);
   return createHash("sha256").update(seed).digest("hex").slice(0, 32);
 }
 
@@ -122,6 +145,8 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
       );
       const hasTools = !!body.tools?.length;
       let parentId: number | null = entry.parentMessageId;
+      // One id/created pair for the whole completion, as OpenAI does.
+      const completion = newCompletionMeta();
 
       if (stream) {
         // ── Streaming response ──────────────────────────────
@@ -131,10 +156,10 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
         res.setHeader("X-Accel-Buffering", "no");
 
         // Send initial role chunk
-        const initChunk = makeChunk(modelId, { role: "assistant" }, null);
+        const initChunk = makeChunk(completion, modelId, { role: "assistant" });
         res.write(`data: ${JSON.stringify(initChunk)}\n\n`);
 
-        const state = createStreamState(hasTools);
+        const state = createStreamState(hasTools, body.tools);
 
         for await (const event of client.chatCompletion({
           chatSessionId: entry.sessionId,
@@ -151,7 +176,7 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
           }
 
           if (delta.content || delta.reasoning) {
-            const chunk = makeChunk(modelId, {
+            const chunk = makeChunk(completion, modelId, {
               ...(delta.content ? { content: delta.content } : {}),
               ...(delta.reasoning ? { reasoning_content: delta.reasoning } : {}),
             });
@@ -167,29 +192,51 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
           messageCount: body.messages.length,
         });
 
-        // In tool mode, inspect the full buffered state
-        const toolCall = extractToolCall(state);
-        if (toolCall) {
-          if (toolCall.leadingText) {
-            const leadingChunk = makeChunk(modelId, { content: toolCall.leadingText });
+        // In tool mode, the buffered response is only interpretable once the
+        // model has finished emitting it.
+        const parsed = extractToolCalls(state);
+        const usage = requestUsage(sessions, convKey, state.usage);
+
+        // A malformed tool call must not look like a finished turn: the SDK
+        // raises APIError on an `error` frame, so the loop stops loudly.
+        if (parsed.error) {
+          res.write(
+            `data: ${JSON.stringify(
+              errorBody(parsed.error, "upstream_error", "tool_call_parse_failed")
+            )}\n\n`
+          );
+          res.end();
+          return;
+        }
+
+        if (parsed.calls.length > 0) {
+          if (parsed.leadingText) {
+            const leadingChunk = makeChunk(completion, modelId, {
+              content: parsed.leadingText,
+            });
             res.write(`data: ${JSON.stringify(leadingChunk)}\n\n`);
           }
-          const chunk = makeToolCallChunk(modelId, toolCall);
+          const chunk = makeToolCallChunk(completion, modelId, parsed.calls);
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         } else if (state.hasTools && state.content) {
-          const chunk = makeChunk(modelId, { content: state.content });
+          const chunk = makeChunk(completion, modelId, { content: state.content });
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         }
 
-        // Send final chunk
-        const finishReason = toolCall ? "tool_calls" : "stop";
-        const finalChunk = makeChunk(modelId, {}, finishReason);
+        if (body.stream_options?.include_usage && usage) {
+          const usageChunk = makeUsageChunk(completion, modelId, usage);
+          res.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
+        }
+
+        // Send final chunk. finish_reason is set exactly once per stream.
+        const finishReason = parsed.calls.length > 0 ? "tool_calls" : "stop";
+        const finalChunk = makeChunk(completion, modelId, {}, finishReason);
         res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
       } else {
         // ── Non-streaming response ──────────────────────────
-        const state = createStreamState(hasTools);
+        const state = createStreamState(hasTools, body.tools);
 
         for await (const event of client.chatCompletion({
           chatSessionId: entry.sessionId,
@@ -212,36 +259,50 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
           messageCount: body.messages.length,
         });
 
-        const toolCall = extractToolCall(state);
+        const parsed = extractToolCalls(state);
+        const usage = requestUsage(sessions, convKey, state.usage);
+
+        // Fail loudly rather than returning a clean stop that an agent loop
+        // would read as "the model finished without calling a tool".
+        if (parsed.error) {
+          res
+            .status(502)
+            .json(
+              errorBody(parsed.error, "upstream_error", "tool_call_parse_failed")
+            );
+          return;
+        }
+
         const reasoning = state.thinking || undefined;
         const message: OpenAIMessage =
-          toolCall
+          parsed.calls.length > 0
             ? {
                 role: "assistant",
-                content: toolCall.leadingText || null,
+                content: parsed.leadingText || null,
                 ...(reasoning ? { reasoning_content: reasoning } : {}),
-                tool_calls: [
-                  {
-                    id: toolCall.id,
-                    type: "function",
-                    function: {
-                      name: toolCall.name,
-                      arguments: toolCall.arguments,
-                    },
-                  } satisfies OpenAIToolCall,
-                ],
+                tool_calls: parsed.calls.map(
+                  (tool) =>
+                    ({
+                      id: tool.id,
+                      type: "function",
+                      function: {
+                        name: tool.name,
+                        arguments: tool.arguments,
+                      },
+                    }) satisfies OpenAIToolCall
+                ),
               }
             : {
                 role: "assistant",
                 content: state.content,
                 ...(reasoning ? { reasoning_content: reasoning } : {}),
               };
-        const finishReason = toolCall ? "tool_calls" : "stop";
+        const finishReason = parsed.calls.length > 0 ? "tool_calls" : "stop";
 
         res.json({
-          id: `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+          id: completion.id,
           object: "chat.completion",
-          created: Math.floor(Date.now() / 1000),
+          created: completion.created,
           model: modelId,
           choices: [
             {
@@ -250,7 +311,7 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
               finish_reason: finishReason,
             },
           ],
-          usage: {
+          usage: usage ?? {
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,
@@ -270,14 +331,17 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
       console.error("Chat completion error:", err);
 
       if (res.headersSent) {
-        // Already streaming — emit an SSE error event and close
-        res.write(`data: ${JSON.stringify({ error: { message, type } })}\n\n`);
-        res.write("data: [DONE]\n\n");
+        // Already streaming. An `error` frame makes the SDK raise APIError;
+        // deliberately no [DONE], so a client cannot mistake a failure for a
+        // cleanly finished turn.
+        res.write(`data: ${JSON.stringify(errorBody(message, type))}\n\n`);
         res.end();
         return;
       }
 
-      res.status(authExpired ? 401 : 500).json({ error: { message, type } });
+      res
+        .status(authExpired ? 401 : 500)
+        .json(errorBody(message, type));
     }
   });
 

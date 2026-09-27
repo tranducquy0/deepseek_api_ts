@@ -6,6 +6,8 @@ export interface SessionEntry {
   parentMessageId: number | null;
   lastMessageCount: number;
   updatedAt: number;
+  /** Last session-cumulative token total seen for this conversation. */
+  usageBaseline: number | null;
 }
 
 const SESSION_TTL = 60 * 60 * 1000; // 1 hour
@@ -43,6 +45,7 @@ export class SessionManager {
       parentMessageId: null,
       lastMessageCount: 0,
       updatedAt: Date.now(),
+      usageBaseline: null,
     };
     this.entries.set(key, entry);
     return entry;
@@ -69,6 +72,24 @@ export class SessionManager {
     entry.parentMessageId = parseParentMessageId(state.parentMessageId);
     entry.lastMessageCount = state.messageCount;
     entry.updatedAt = Date.now();
+  }
+
+  /**
+   * Convert DeepSeek's session-cumulative token total into a per-request
+   * figure, as OpenAI reports. A conversation that keeps chaining into one
+   * DeepSeek session would otherwise re-report every earlier turn's tokens.
+   */
+  usageDelta(key: string, sessionTotal: number | null): number | null {
+    if (sessionTotal == null) return null;
+    const entry = this.entries.get(key);
+    if (!entry) return sessionTotal;
+
+    const delta =
+      entry.usageBaseline != null && sessionTotal > entry.usageBaseline
+        ? sessionTotal - entry.usageBaseline
+        : sessionTotal;
+    entry.usageBaseline = sessionTotal;
+    return delta;
   }
 
   /** Drop a conversation (forces a fresh DeepSeek session next turn). */

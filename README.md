@@ -7,7 +7,8 @@ endpoint — compatible with ChatGPT-style apps, Claude Code, scripts, etc.
 ## Features
 
 - `POST /v1/chat/completions` — streaming (`stream: true`) and non-streaming responses
-- Tool / function calling (`tools`, `tool_choice`, `tool_calls`, `role: "tool"`)
+- Tool / function calling (`tools`, `tool_choice`, `tool_calls`, `role: "tool"`),
+  including several calls per turn
 - Thinking toggle for the reasoning model (`thinking: true`, or use `deepseek-reasoner`),
   streamed as OpenAI `reasoning_content`
 - Multi-turn conversation chaining via DeepSeek session `parent_message_id`
@@ -77,7 +78,8 @@ Body fields:
 | ------------------ | ----------------------------- | -------------------------------------------------- |
 | `model`            | `string`                      | `deepseek-chat` (V3) or `deepseek-reasoner` (R1)   |
 | `messages`         | `OpenAIMessage[]`             | roles: `system`, `user`, `assistant`, `tool`       |
-| `stream`           | `boolean`                     | SSE when `true`; JSON by default (as per OpenAI)      |
+| `stream`           | `boolean`                     | SSE when `true`; JSON by default (as per OpenAI)   |
+| `stream_options`   | `{include_usage?}`            | Adds a final usage-only chunk when streaming       |
 | `thinking`         | `boolean`                     | Force reasoning on/off (default: on for reasoner)  |
 | `tools`            | `OpenAITool[]`                | Function calling                                   |
 | `tool_choice`      | `string \| object`            | `"auto"`, `"none"`, `"required"`, or `{...}`       |
@@ -85,11 +87,48 @@ Body fields:
 | `temperature`      | `number`                      | Accepted, ignored                                  |
 | `max_tokens`       | `number`                      | Accepted, ignored                                  |
 
+Every chunk of one completion shares a single `id`/`created` pair, and `finish_reason` is
+set exactly once, on the terminal chunk — as OpenAI does.
+
+`usage` is reported for both streaming and non-streaming responses. DeepSeek only exposes
+a token total accumulated over the whole chat session, so the proxy diffs it against the
+previous turn to report a per-request figure. The prompt/completion split is not available
+from the web endpoint and stays `0`.
+
+### Message content
+
+`content` may be a plain string or an OpenAI-style array of content parts
+(`[{"type": "text", "text": "…"}]`), which is what multimodal clients send. Parts are
+flattened to text for DeepSeek's prompt.
+
+DeepSeek's web endpoint carries no inline attachments, so `image_url` and other binary
+parts **cannot be forwarded**. Rather than dropping them silently, the prompt names what
+was omitted (e.g. `[image_url omitted: this proxy does not forward attachments]`) so the
+model is never misled into thinking it saw an image.
+
+### Tool calling
+
 DeepSeek's web API has no native tool support. Tools are injected into the prompt as
-JSON schemas, and the model is instructed to emit a single JSON object
-(`{"name": "...", "arguments": {...}}`). The proxy detects that object and converts it
-into OpenAI `tool_calls` with `finish_reason: "tool_calls"` — so standard OpenAI
-tool-calling clients work unchanged.
+JSON schemas, and the model is instructed to emit one JSON object per line
+(`{"name": "...", "arguments": {...}}`). The proxy scans for those objects and converts
+them into OpenAI `tool_calls` — several per turn are supported, indexed `0..n-1` and
+reported with `finish_reason: "tool_calls"`, so standard OpenAI tool-calling clients work
+unchanged.
+
+Parsing tolerates surrounding prose, markdown fences, and stray braces. The model
+frequently drops the `{"name": …, "arguments": …}` wrapper and emits the bare arguments
+instead; those are bound to the offered function automatically **only when exactly one
+function's schema accepts them**, since guessing between several could run the wrong
+command. A `tool`/`function` key is accepted as an alias for `name`.
+
+If the model aimed for a tool call but the result is malformed or ambiguous, the proxy
+**fails loudly** rather than ending the turn as if nothing was called — a silent
+`finish_reason: "stop"` would let an agent loop record a step that never happened:
+
+| Mode         | Response                                                      |
+| ------------ | ------------------------------------------------------------- |
+| non-streaming| `502` with `error.code = "tool_call_parse_failed"`            |
+| streaming    | an SSE `error` frame and **no** `[DONE]` (SDKs raise `APIError`) |
 
 ### `GET /v1/models`
 
@@ -122,14 +161,19 @@ npm run dev     # tsx hot-run src/cli.ts
 - **Unofficial.** This reverse-engineers the web client; DeepSeek may change the API or
   terms without notice. Use at your own risk and don't rely on it for production.
 - Tokens are stored in **plaintext** on disk.
+- Multimodal input is flattened to text; image and other attachment parts are **not**
+  forwarded (see [Message content](#message-content)).
 - One DeepSeek session per conversation; concurrent requests to the same conversation are
   last-writer-wins.
+- `tool_choice` is a prompt instruction, not an enforced contract.
 - Changing `system` messages mid-conversation keeps the server-side one.
 - `temperature` / `max_tokens` are accepted but not enforced.
 
 ## Roadmap
 
 - Abort upstream DeepSeek stream when the client disconnects
+- Enforce `tool_choice: "required"` instead of only asking for it in the prompt
+- Detect compacted client history instead of mis-slicing `messages[]`
+- Serialize turns per conversation, or reject concurrent ones with `409`
 - Account info endpoint and `ds status` CLI command
 - Configurable bind host for LAN access
-- Report real `usage` token counts (currently stubbed as `0`)

@@ -3,16 +3,70 @@ import {
   applyStreamEvent,
   buildPrompt,
   buildModelList,
+  contentToText,
   createStreamState,
-  extractToolCall,
+  extractToolCalls,
   makeChunk,
   makeToolCallChunk,
+  makeUsageChunk,
   mapModel,
-  parseToolCall,
+  newCompletionMeta,
+  parseToolCalls,
 } from "./convert.js";
 import type { DSStreamEvent } from "./types.js";
 
+describe("contentToText", () => {
+  it("passes plain strings through", () => {
+    expect(contentToText("hello")).toBe("hello");
+  });
+
+  it("treats null and undefined as empty", () => {
+    expect(contentToText(null)).toBe("");
+    expect(contentToText(undefined)).toBe("");
+  });
+
+  it("flattens OpenAI content parts instead of stringifying them", () => {
+    expect(
+      contentToText([
+        { type: "text", text: "first" },
+        { type: "text", text: "second" },
+      ])
+    ).toBe("first\nsecond");
+  });
+
+  it("names parts it cannot forward rather than dropping them", () => {
+    const text = contentToText([
+      { type: "text", text: "what is this?" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAA" } },
+    ]);
+    expect(text).toContain("what is this?");
+    expect(text).toContain("image_url omitted");
+    expect(text).not.toContain("[object Object]");
+  });
+});
+
 describe("buildPrompt", () => {
+  it("renders a multimodal user turn as real text", () => {
+    const prompt = buildPrompt([
+      { role: "user", content: [{ type: "text", text: "Summarise the repo." }] },
+    ]);
+    expect(prompt).toBe("Summarise the repo.");
+    expect(prompt).not.toContain("[object Object]");
+  });
+
+  it("flattens content parts in every role", () => {
+    const prompt = buildPrompt([
+      { role: "system", content: [{ type: "text", text: "be terse" }] },
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant", content: [{ type: "text", text: "hello" }] },
+      { role: "tool", tool_call_id: "c1", content: [{ type: "text", text: "42" }] },
+    ]);
+    expect(prompt).toContain("[System]: be terse");
+    expect(prompt).toContain("[Assistant]: hello");
+    expect(prompt).toContain("[Tool result for c1]: 42");
+    expect(prompt).not.toContain("[object Object]");
+  });
+
   it("flattens system/user/assistant messages", () => {
     const prompt = buildPrompt([
       { role: "system", content: "You are helpful" },
@@ -37,6 +91,24 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("# Available Tools");
     expect(prompt).toContain("get_weather");
     expect(prompt).toContain("weather?");
+  });
+
+  it("names the callable functions and shows a worked example", () => {
+    const prompt = buildPrompt(
+      [{ role: "user", content: "weather?" }],
+      [
+        {
+          type: "function",
+          function: {
+            name: "get_weather",
+            parameters: { type: "object", properties: { city: { type: "string" } } },
+          },
+        },
+        { type: "function", function: { name: "get_time", parameters: {} } },
+      ]
+    );
+    expect(prompt).toContain('"name" must be exactly one of: get_weather, get_time');
+    expect(prompt).toContain('{"name": "get_weather", "arguments": { "city": "..." }}');
   });
 
   it("honours tool_choice none", () => {
@@ -255,64 +327,205 @@ describe("applyStreamEvent", () => {
 
 describe("parseToolCall", () => {
   it("parses a plain JSON object", () => {
-    const call = parseToolCall('{"name":"get_weather","arguments":{"city":"Hanoi"}}');
-    expect(call?.name).toBe("get_weather");
-    expect(JSON.parse(call!.arguments)).toEqual({ city: "Hanoi" });
-    expect(call?.leadingText).toBeUndefined();
+    const { calls, leadingText } = parseToolCalls(
+      '{"name":"get_weather","arguments":{"city":"Hanoi"}}'
+    );
+    expect(calls[0].name).toBe("get_weather");
+    expect(JSON.parse(calls[0].arguments)).toEqual({ city: "Hanoi" });
+    expect(leadingText).toBeUndefined();
   });
 
   it("parses fenced JSON", () => {
-    const call = parseToolCall('```json\n{"name":"search","params":{"q":"x"}}\n```');
-    expect(call?.name).toBe("search");
-    expect(JSON.parse(call!.arguments)).toEqual({ q: "x" });
+    const { calls } = parseToolCalls('```json\n{"name":"search","params":{"q":"x"}}\n```');
+    expect(calls[0].name).toBe("search");
+    expect(JSON.parse(calls[0].arguments)).toEqual({ q: "x" });
   });
 
   it("parses JSON embedded in prose and captures leading text", () => {
-    const call = parseToolCall(
+    const { calls, leadingText } = parseToolCalls(
       'Let me check that.\n{"name":"f","arguments":{}}\nDone.'
     );
-    expect(call?.name).toBe("f");
-    expect(call?.leadingText).toBe("Let me check that.");
+    expect(calls[0].name).toBe("f");
+    expect(leadingText).toBe("Let me check that.");
   });
 
-  it("returns null for non-JSON answers", () => {
-    expect(parseToolCall("just a normal answer")).toBeNull();
-    expect(parseToolCall("{}")).toBeNull();
-    expect(parseToolCall('{"name":"","arguments":{}}')).toBeNull();
+  it("parses several calls in one response, indexed in order", () => {
+    const { calls } = parseToolCalls(
+      '{"name":"read","arguments":{"p":"a"}}\n{"name":"read","arguments":{"p":"b"}}'
+    );
+    expect(calls.map((c) => [c.index, c.name, c.arguments])).toEqual([
+      [0, "read", '{"p":"a"}'],
+      [1, "read", '{"p":"b"}'],
+    ]);
+  });
+
+  it("ignores a stray brace in prose instead of swallowing the call", () => {
+    const { calls } = parseToolCalls(
+      'Use {placeholder} then:\n{"name":"read","arguments":{}}'
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0].name).toBe("read");
+  });
+
+  it("does not treat braces inside JSON strings as object boundaries", () => {
+    const { calls } = parseToolCalls('{"name":"f","arguments":{"q":"a}b{c"}}');
+    expect(calls[0].name).toBe("f");
+    expect(JSON.parse(calls[0].arguments)).toEqual({ q: "a}b{c" });
+  });
+
+  it("returns no calls for non-JSON answers", () => {
+    expect(parseToolCalls("just a normal answer").calls).toEqual([]);
+    expect(parseToolCalls("{}").calls).toEqual([]);
+    expect(parseToolCalls('{"name":"","arguments":{}}').calls).toEqual([]);
+  });
+
+  it("binds a wrapper-less argument object when only one function can take it", () => {
+    // DeepSeek frequently drops the {"name":…,"arguments":…} wrapper.
+    const tools = [
+      {
+        type: "function" as const,
+        function: {
+          name: "bash",
+          parameters: {
+            type: "object",
+            required: ["command"],
+            properties: { command: { type: "string" }, timeout: { type: "number" } },
+          },
+        },
+      },
+    ];
+    const { calls, error } = parseToolCalls('{"command": "ls -la"}', tools);
+    expect(error).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].name).toBe("bash");
+    expect(JSON.parse(calls[0].arguments)).toEqual({ command: "ls -la" });
+  });
+
+  it("refuses to guess when a wrapper-less object fits several functions", () => {
+    // read and write both take a bare {path}; picking one could run the wrong
+    // tool, so this must fail loudly instead.
+    const tools = ["read", "write"].map((name) => ({
+      type: "function" as const,
+      function: {
+        name,
+        parameters: {
+          type: "object",
+          required: ["path"],
+          properties: { path: { type: "string" } },
+        },
+      },
+    }));
+    const result = parseToolCalls('{"path": "a.py"}', tools);
+    expect(result.calls).toEqual([]);
+    expect(result.error).toContain("did not satisfy exactly one function");
+    expect(result.error).toContain("read");
+    expect(result.error).toContain("write");
+  });
+
+  it("does not hijack a JSON answer that no function accepts", () => {
+    const tools = [
+      {
+        type: "function" as const,
+        function: {
+          name: "bash",
+          parameters: {
+            type: "object",
+            required: ["command"],
+            properties: { command: { type: "string" } },
+          },
+        },
+      },
+    ];
+    const result = parseToolCalls('{"answer": "42"}', tools);
+    expect(result.calls).toEqual([]);
+    expect(result.error).toBeUndefined();
+  });
+
+  it("accepts tool/function as aliases for the name field", () => {
+    expect(parseToolCalls('{"tool":"read","args":{"path":"a"}}').calls[0].name).toBe("read");
+    expect(
+      parseToolCalls('{"function":"read","parameters":{"path":"a"}}').calls[0].name
+    ).toBe("read");
+  });
+
+  it("reports a loud error when a tool call cannot be parsed", () => {
+    const result = parseToolCalls('{"name": "read", "arguments": {"p": "a"');
+    expect(result.calls).toEqual([]);
+    expect(result.error).toMatch(/unparseable tool call/);
+    expect(result.error).toContain('"name": "read"');
+  });
+
+  it("does not report an error for prose that merely mentions JSON", () => {
+    expect(parseToolCalls("Here is a dict: {'a': 1}").error).toBeUndefined();
+    expect(parseToolCalls('Use "name": value freely').error).toBeUndefined();
   });
 });
 
-
-describe("extractToolCall", () => {
-  it("extracts a tool call only in tool mode", () => {
+describe("extractToolCalls", () => {
+  it("extracts tool calls only in tool mode", () => {
     const state = createStreamState(true);
     state.content = '{"name":"f","arguments":{"a":1}}';
-    expect(extractToolCall(state)).not.toBeNull();
+    expect(extractToolCalls(state).calls).toHaveLength(1);
 
     const plain = createStreamState(false);
     plain.content = '{"name":"f","arguments":{}}';
-    expect(extractToolCall(plain)).toBeNull();
+    expect(extractToolCalls(plain).calls).toEqual([]);
+  });
+
+  it("surfaces the parse error in tool mode only", () => {
+    const state = createStreamState(true);
+    state.content = '{"name": "f", "arguments":';
+    expect(extractToolCalls(state).error).toBeDefined();
+
+    const plain = createStreamState(false);
+    plain.content = '{"name": "f", "arguments":';
+    expect(extractToolCalls(plain).error).toBeUndefined();
   });
 });
 
 describe("chunk helpers", () => {
   it("builds content chunks", () => {
-    const chunk = makeChunk("deepseek-chat", { content: "hi" });
+    const chunk = makeChunk(newCompletionMeta(), "deepseek-chat", { content: "hi" });
     expect(chunk.object).toBe("chat.completion.chunk");
     expect(chunk.choices[0].delta.content).toBe("hi");
     expect(chunk.choices[0].finish_reason).toBeNull();
   });
 
-  it("builds tool-call chunks with tool_calls finish reason", () => {
-    const chunk = makeToolCallChunk("deepseek-chat", {
-      id: "call_1",
-      name: "f",
-      arguments: "{}",
-    });
-    expect(chunk.choices[0].finish_reason).toBe("tool_calls");
-    expect(chunk.choices[0].delta.tool_calls).toMatchObject([
-      { id: "call_1", type: "function", function: { name: "f", arguments: "{}" } },
+  it("reuses one id and created across every chunk of a completion", () => {
+    const meta = newCompletionMeta();
+    const a = makeChunk(meta, "deepseek-chat", { content: "a" });
+    const b = makeChunk(meta, "deepseek-chat", { content: "b" }, "stop");
+    expect(a.id).toBe(b.id);
+    expect(a.created).toBe(b.created);
+  });
+
+  it("mints a distinct id per completion", () => {
+    expect(newCompletionMeta().id).not.toBe(newCompletionMeta().id);
+  });
+
+  it("leaves finish_reason null on tool-call chunks", () => {
+    const chunk = makeToolCallChunk(newCompletionMeta(), "deepseek-chat", [
+      { index: 0, id: "call_1", name: "f", arguments: "{}" },
+      { index: 1, id: "call_2", name: "g", arguments: "{}" },
     ]);
+    // OpenAI sets finish_reason exactly once, on the terminal chunk.
+    expect(chunk.choices[0].finish_reason).toBeNull();
+    expect(chunk.choices[0].delta.tool_calls).toMatchObject([
+      { index: 0, id: "call_1", type: "function", function: { name: "f" } },
+      { index: 1, id: "call_2", type: "function", function: { name: "g" } },
+    ]);
+  });
+
+  it("builds a usage-only chunk with no choices", () => {
+    const meta = newCompletionMeta();
+    const chunk = makeUsageChunk(meta, "deepseek-chat", {
+      prompt_tokens: 0,
+      completion_tokens: 465,
+      total_tokens: 465,
+    });
+    expect(chunk.id).toBe(meta.id);
+    expect(chunk.choices).toEqual([]);
+    expect(chunk.usage?.total_tokens).toBe(465);
   });
 });
 

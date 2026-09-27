@@ -16,9 +16,22 @@ export interface Cookie {
 
 // ── OpenAI types ────────────────────────────────────────────────────
 
+/** A single part of an OpenAI-style multimodal message. */
+export interface ContentPart {
+  type?: string;
+  text?: string;
+  image_url?: { url?: string } | string;
+}
+
+/**
+ * Message content as sent by OpenAI clients: a plain string, or an array of
+ * content parts for multimodal input. DeepSeek's web endpoint is text-only.
+ */
+export type MessageContent = string | ContentPart[] | null;
+
 export interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: MessageContent;
   /** Reasoning text from the `deepseek-reasoner` model. */
   reasoning_content?: string | null;
   tool_calls?: OpenAIToolCall[];
@@ -34,12 +47,20 @@ export interface OpenAIChatRequest {
   thinking?: boolean;
   tools?: OpenAITool[];
   tool_choice?: string | { type: "function"; function: { name: string } };
+  /** OpenAI streaming options; `include_usage` adds a final usage chunk. */
+  stream_options?: { include_usage?: boolean };
   /** Optional stable conversation identity used to key DeepSeek sessions */
   user?: string;
   /** Optional explicit DeepSeek chat session ID */
   chat_session_id?: string;
   chatSessionId?: string;
   session_id?: string;
+}
+
+export interface CompletionUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
 }
 
 export interface OpenAIChunk {
@@ -52,6 +73,8 @@ export interface OpenAIChunk {
     delta: Partial<OpenAIMessage>;
     finish_reason: "stop" | "length" | "tool_calls" | null;
   }[];
+  /** Present when the client asked for usage via `stream_options`. */
+  usage?: CompletionUsage | null;
 }
 
 export interface OpenAIModel {
