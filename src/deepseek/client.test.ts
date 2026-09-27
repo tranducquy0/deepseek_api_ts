@@ -1,6 +1,131 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { DeepSeekClient, parseParentMessageId } from "./client.js";
+import {
+  DeepSeekClient,
+  AuthExpiredError,
+  DeepSeekApiError,
+  parseParentMessageId,
+} from "./client.js";
 import { deepSeekHash } from "./pow.js";
+
+describe("DeepSeek error envelopes", () => {
+  // DeepSeek answers a rejected token with HTTP 200 and the failure in the
+  // body, so res.ok is true and the status code proves nothing.
+  const authFailure = { code: 40003, msg: "Authorization Failed (invalid token)", data: null };
+
+  it("validate throws AuthExpiredError for an in-body 40003", async () => {
+    const client = new DeepSeekClient({ auth: { token: "t", cookies: [] } });
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => authFailure,
+    } as Response);
+
+    // The old check was `return res.ok`, which is true here.
+    await expect(client.validate()).rejects.toThrow(AuthExpiredError);
+  });
+
+  it("validate passes on a normal envelope", async () => {
+    const client = new DeepSeekClient({ auth: { token: "t", cookies: [] } });
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ code: 0, data: { id: "u1" } }),
+    } as Response);
+    await expect(client.validate()).resolves.toBeUndefined();
+  });
+
+  it("createSession reports the token, not a missing session id", async () => {
+    const client = new DeepSeekClient({ auth: { token: "t", cookies: [] } });
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => authFailure,
+    } as Response);
+
+    await expect(client.createSession()).rejects.toThrow(AuthExpiredError);
+    await expect(client.createSession()).rejects.toThrow(/ds auth/);
+  });
+
+  it("createSession surfaces a non-auth API code", async () => {
+    const client = new DeepSeekClient({ auth: { token: "t", cookies: [] } });
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ code: 10024, msg: "rate limited" }),
+    } as Response);
+
+    await expect(client.createSession()).rejects.toThrow(DeepSeekApiError);
+  });
+
+  it("chatCompletion refuses to read a JSON error envelope as a stream", async () => {
+    const client = new DeepSeekClient({ auth: { token: "t", cookies: [] } });
+    const salt = "s";
+    const expireAt = 1;
+    const challenge = deepSeekHash(Buffer.from(`${salt}_${expireAt}_0`)).toString("hex");
+
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.endsWith("/create_pow_challenge")) {
+        return {
+          ok: true,
+          json: async () => ({ salt, expire_at: expireAt, challenge, difficulty: 0, signature: "sig" }),
+        } as Response;
+      }
+      // What DeepSeek actually returns here: 200, but JSON, not SSE.
+      return {
+        ok: true,
+        headers: new Headers({ "content-type": "application/json" }),
+        json: async () => ({ code: 40003, msg: "INVALID_TOKEN", data: null }),
+      } as Response;
+    });
+
+    // Without the content-type check this yielded zero events, which the router
+    // turned into an empty answer with finish_reason "stop" and HTTP 200.
+    const drain = async () => {
+      for await (const _ of client.chatCompletion({
+        chatSessionId: "sess",
+        parentMessageId: null,
+        prompt: "hi",
+        thinkingEnabled: false,
+        modelType: "default",
+      })) {
+        // no events expected
+      }
+    };
+    await expect(drain()).rejects.toThrow(AuthExpiredError);
+  });
+
+  it("chatCompletion rejects a non-stream, non-envelope response", async () => {
+    const client = new DeepSeekClient({ auth: { token: "t", cookies: [] } });
+    const salt = "s";
+    const expireAt = 1;
+    const challenge = deepSeekHash(Buffer.from(`${salt}_${expireAt}_0`)).toString("hex");
+
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.endsWith("/create_pow_challenge")) {
+        return {
+          ok: true,
+          json: async () => ({ salt, expire_at: expireAt, challenge, difficulty: 0, signature: "sig" }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        headers: new Headers({ "content-type": "text/html" }),
+        json: async () => ({ something: "else" }),
+      } as Response;
+    });
+
+    const drain = async () => {
+      for await (const _ of client.chatCompletion({
+        chatSessionId: "sess",
+        parentMessageId: null,
+        prompt: "hi",
+        thinkingEnabled: false,
+        modelType: "default",
+      })) {
+        // no events expected
+      }
+    };
+    await expect(drain()).rejects.toThrow(/instead of an event stream/);
+  });
+});
 
 describe("parseParentMessageId", () => {
   it("converts string digits to numbers", () => {
@@ -161,6 +286,7 @@ describe("DeepSeekClient", () => {
         capturedBody = JSON.parse(opts.body);
         return {
           ok: true,
+          headers: new Headers({ "content-type": "text/event-stream" }),
           body: {
             getReader: () => {
               let done = false;
@@ -221,6 +347,7 @@ describe("DeepSeekClient", () => {
       if (url.endsWith("/completion")) {
         return {
           ok: true,
+          headers: new Headers({ "content-type": "text/event-stream" }),
           body: {
             getReader: () => {
               let done = false;

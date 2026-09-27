@@ -63,14 +63,16 @@ export class DeepSeekClient {
     return res;
   }
 
-  /** Validate the current token. */
-  async validate(): Promise<boolean> {
-    try {
-      const res = await this.request("/api/v0/users/current");
-      return res.ok;
-    } catch {
-      return false;
-    }
+  /**
+   * Verify the current token.
+   *
+   * Throws `AuthExpiredError` when DeepSeek rejects it. Note that DeepSeek
+   * answers a bad token with HTTP 200 and `{"code":40003}` in the body, so
+   * `res.ok` is true and the status code alone proves nothing.
+   */
+  async validate(): Promise<void> {
+    const res = await this.request("/api/v0/users/current");
+    assertEnvelope(await res.json(), "/api/v0/users/current");
   }
 
   /** Create a new chat session, returns session ID. */
@@ -83,6 +85,7 @@ export class DeepSeekClient {
       throw new Error(`Failed to create session: ${res.status} ${text}`);
     }
     const raw: unknown = await res.json();
+    assertEnvelope(raw, "/api/v0/chat_session/create");
     const data = raw as {
       data?: {
         id?: string;
@@ -156,6 +159,7 @@ export class DeepSeekClient {
       throw new Error(`PoW challenge failed: ${powRes.status}`);
     }
     const raw: unknown = await powRes.json();
+    assertEnvelope(raw, "/api/v0/chat/create_pow_challenge");
     const wrapped = raw as { data?: { biz_data?: { challenge?: DSBreadcrumb } } };
     const challenge = (wrapped.data?.biz_data?.challenge ?? raw) as DSBreadcrumb;
 
@@ -184,6 +188,19 @@ export class DeepSeekClient {
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`Chat completion failed: ${res.status} ${text}`);
+    }
+
+    // A rejected token makes DeepSeek answer this endpoint with a JSON error
+    // envelope and HTTP 200 instead of an event stream. Reading that as SSE
+    // yields no frames at all, which would look like a successful but empty
+    // answer — so the content type is checked before parsing.
+    const contentType = res.headers.get("content-type") ?? "";
+    if (!contentType.includes("text/event-stream")) {
+      const raw: unknown = await res.json().catch(() => null);
+      assertEnvelope(raw, "/api/v0/chat/completion");
+      throw new Error(
+        `Chat completion returned ${contentType || "an unknown content type"} instead of an event stream`
+      );
     }
 
     // 4. Parse SSE stream
@@ -241,6 +258,42 @@ export class AuthExpiredError extends Error {
     super(msg);
     this.name = "AuthExpiredError";
   }
+}
+
+/** A non-auth failure reported by DeepSeek in a response body. */
+export class DeepSeekApiError extends Error {
+  constructor(
+    readonly code: number | string,
+    message: string
+  ) {
+    super(`DeepSeek API error ${code}: ${message}`);
+    this.name = "DeepSeekApiError";
+  }
+}
+
+/** DeepSeek error codes that mean the token was rejected. */
+const AUTH_ERROR_CODES = new Set([40003]);
+
+/**
+ * Throw if a DeepSeek response body reports a failure.
+ *
+ * DeepSeek signals API errors inside a HTTP 200 body as `{"code":…,"msg":…}`,
+ * so `res.ok` and the status code are both useless for detecting them. Without
+ * this, a rejected token surfaced as a missing session id, a generic 500, or —
+ * worst of all — a successful-looking empty answer.
+ */
+function assertEnvelope(raw: unknown, what: string): void {
+  const env = (raw ?? {}) as { code?: number | string; msg?: string };
+  const code = env.code;
+  if (code === undefined || code === null || code === 0 || code === "0") return;
+
+  const message = typeof env.msg === "string" ? env.msg : "unknown error";
+  if (AUTH_ERROR_CODES.has(Number(code)) || /token|authoriz/i.test(message)) {
+    throw new AuthExpiredError(
+      `DeepSeek rejected the token (${code}: ${message}). Run \`ds auth\` to re-authenticate.`
+    );
+  }
+  throw new DeepSeekApiError(code, `${what}: ${message}`);
 }
 
 export function parseParentMessageId(id: number | string | null | undefined): number | null {

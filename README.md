@@ -47,6 +47,11 @@ Or pass it directly: `ds auth <TOKEN>`.
 
 Credentials are stored in plaintext at `~/.ds/auth.json`. Keep it private.
 
+Tokens expire. When one is rejected the server reports it at startup and refuses to
+start, and in-flight requests fail with `401 auth_error` instead of a generic error — so
+re-run `ds auth` to refresh. DeepSeek reports auth failures as HTTP 200 with an error
+code in the body, so the proxy inspects the body rather than the status code.
+
 ### 2. Start the server
 
 ```sh

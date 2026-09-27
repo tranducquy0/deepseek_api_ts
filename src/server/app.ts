@@ -1,6 +1,6 @@
 import express from "express";
 import type { AuthData } from "../shared/types.js";
-import { DeepSeekClient } from "../deepseek/client.js";
+import { DeepSeekClient, AuthExpiredError } from "../deepseek/client.js";
 import { loadAuth, saveAuth } from "../auth/store.js";
 import { chatRouter } from "./chat.js";
 import { modelsRouter } from "./models.js";
@@ -29,11 +29,17 @@ export async function startServer(opts: ServerOpts): Promise<void> {
 
   // Validate auth
   console.log("🔍 Validating auth…");
-  const valid = await client.validate();
-  if (!valid) {
-    console.error(
-      "❌ Auth is invalid or expired. Run `ds auth` to re-authenticate."
-    );
+  try {
+    await client.validate();
+  } catch (err) {
+    if (err instanceof AuthExpiredError) {
+      console.error("❌ " + err.message);
+    } else {
+      console.error(
+        "❌ Could not validate auth with DeepSeek:",
+        (err as Error).message
+      );
+    }
     process.exit(1);
   }
   console.log("✅ Auth valid.");
