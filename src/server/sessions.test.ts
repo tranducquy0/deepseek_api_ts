@@ -61,6 +61,39 @@ describe("SessionManager", () => {
     expect(sessions.get("conv-1")).toBeNull();
   });
 
+  it("replaces the session on restart and clears chaining state", async () => {
+    const first = await sessions.getOrCreate(client, "conv-1");
+    sessions.update("conv-1", {
+      parentMessageId: "99",
+      messageCount: 4,
+      historyDigest: "abc",
+    });
+
+    const restarted = await sessions.restart(client, "conv-1");
+    expect(restarted.sessionId).not.toBe(first.sessionId);
+    expect(client.sessionCalls).toBe(2);
+    expect(restarted.parentMessageId).toBeNull();
+    expect(restarted.lastMessageCount).toBe(0);
+    expect(restarted.historyDigest).toBeNull();
+  });
+
+  it("restart reuses a client-pinned session id", async () => {
+    await sessions.getOrCreate(client, "conv-1");
+    const restarted = await sessions.restart(client, "conv-1", "pinned-1");
+    expect(restarted.sessionId).toBe("pinned-1");
+    expect(client.sessionCalls).toBe(1);
+  });
+
+  it("persists the history digest for rewrite detection", async () => {
+    await sessions.getOrCreate(client, "conv-1");
+    sessions.update("conv-1", {
+      parentMessageId: "1",
+      messageCount: 2,
+      historyDigest: "deadbeef",
+    });
+    expect(sessions.get("conv-1")?.historyDigest).toBe("deadbeef");
+  });
+
   it("uses explicitSessionId when provided instead of calling createSession", async () => {
     const entry = await sessions.getOrCreate(client, "explicit-123", "explicit-123");
     expect(entry.sessionId).toBe("explicit-123");

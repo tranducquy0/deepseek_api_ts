@@ -82,7 +82,7 @@ Body fields:
 | `stream_options`   | `{include_usage?}`            | Adds a final usage-only chunk when streaming       |
 | `thinking`         | `boolean`                     | Force reasoning on/off (default: on for reasoner)  |
 | `tools`            | `OpenAITool[]`                | Function calling                                   |
-| `tool_choice`      | `string \| object`            | `"auto"`, `"none"`, `"required"`, or `{...}`       |
+| `tool_choice`      | `string \| object`            | `"auto"`, `"none"`, `"required"`, or `{...}`; enforced |
 | `user`             | `string`                      | Optional stable conversation id for session reuse  |
 | `temperature`      | `number`                      | Accepted, ignored                                  |
 | `max_tokens`       | `number`                      | Accepted, ignored                                  |
@@ -130,6 +130,20 @@ If the model aimed for a tool call but the result is malformed or ambiguous, the
 | non-streaming| `502` with `error.code = "tool_call_parse_failed"`            |
 | streaming    | an SSE `error` frame and **no** `[DONE]` (SDKs raise `APIError`) |
 
+`tool_choice` is enforced, not merely suggested. Since it only reaches DeepSeek as a
+prompt instruction, the model sometimes answers in prose anyway — so the turn is verified
+against the request afterwards:
+
+| `tool_choice`               | Violation                                                 |
+| --------------------------- | --------------------------------------------------------- |
+| `"required"`                | model answered without calling a function                |
+| `"none"`                    | model called a function anyway                            |
+| `{"function":{"name":"x"}}` | model called a function other than `x`, or none at all    |
+
+A violation returns `502` with `error.code = "tool_choice_violation"` (or an SSE `error`
+frame when streaming), so an agent loop cannot mistake it for a finished turn. Sending
+`"required"` or a forced function without any `tools` is a `400`.
+
 ### `GET /v1/models`
 
 Lists the supported model ids.
@@ -148,6 +162,18 @@ A conversation is keyed by the `user` field when present; otherwise by a hash of
 first user message. Use a stable `user` id to keep related turns grouped, or omit it and
 keep the first message identical across turns.
 
+To avoid re-sending history, the proxy remembers a fingerprint of the messages it has
+already forwarded. If the next request merely appends to them, only the new messages are
+sent. If the client **rewrote** that history — compaction, trimming, or an edited
+message — the old DeepSeek session no longer describes the conversation, so the proxy
+starts a fresh one and replays the full history instead of sending a misaligned slice.
+
+The fingerprint covers only what reaches the prompt, so a client that round-trips a
+response through its own SDK (reordering keys, adding null padding, renaming fields) does
+not trigger a replay. A client that mutates an *earlier* message every turn — a
+timestamped system prompt, for instance — will replay each turn, which costs tokens but
+still preserves context.
+
 ## Development
 
 ```sh
@@ -165,15 +191,15 @@ npm run dev     # tsx hot-run src/cli.ts
   forwarded (see [Message content](#message-content)).
 - One DeepSeek session per conversation; concurrent requests to the same conversation are
   last-writer-wins.
-- `tool_choice` is a prompt instruction, not an enforced contract.
+- `tool_choice` is verified after the turn, but a violation surfaces as an error rather
+  than a retry.
+- Rewritten client history is replayed into a new DeepSeek session, which costs tokens.
 - Changing `system` messages mid-conversation keeps the server-side one.
 - `temperature` / `max_tokens` are accepted but not enforced.
 
 ## Roadmap
 
 - Abort upstream DeepSeek stream when the client disconnects
-- Enforce `tool_choice: "required"` instead of only asking for it in the prompt
-- Detect compacted client history instead of mis-slicing `messages[]`
 - Serialize turns per conversation, or reject concurrent ones with `409`
 - Account info endpoint and `ds status` CLI command
 - Configurable bind host for LAN access

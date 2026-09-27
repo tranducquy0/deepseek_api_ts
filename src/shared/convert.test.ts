@@ -3,9 +3,11 @@ import {
   applyStreamEvent,
   buildPrompt,
   buildModelList,
+  checkToolChoice,
   contentToText,
   createStreamState,
   extractToolCalls,
+  fingerprintMessages,
   makeChunk,
   makeToolCallChunk,
   makeUsageChunk,
@@ -480,6 +482,99 @@ describe("extractToolCalls", () => {
     const plain = createStreamState(false);
     plain.content = '{"name": "f", "arguments":';
     expect(extractToolCalls(plain).error).toBeUndefined();
+  });
+});
+
+describe("checkToolChoice", () => {
+  const tools = [
+    { type: "function" as const, function: { name: "search", parameters: {} } },
+    { type: "function" as const, function: { name: "write", parameters: {} } },
+  ];
+  const call = (name: string) => ({
+    calls: [{ index: 0, id: "c1", name, arguments: "{}" }],
+  });
+
+  it("passes when required is satisfied", () => {
+    expect(checkToolChoice("required", tools, call("search"))).toBeNull();
+  });
+
+  it("rejects a prose answer when a call was required", () => {
+    const error = checkToolChoice("required", tools, { calls: [] });
+    expect(error).toContain("required");
+    expect(error).toContain('"search"');
+    expect(error).toContain('"write"');
+  });
+
+  it("rejects a call when none was requested", () => {
+    expect(checkToolChoice("none", tools, call("search"))).toContain("none");
+    expect(checkToolChoice("none", tools, { calls: [] })).toBeNull();
+  });
+
+  it("rejects a call to a function other than the forced one", () => {
+    const forced = { type: "function" as const, function: { name: "write" } };
+    expect(checkToolChoice(forced, tools, call("write"))).toBeNull();
+    expect(checkToolChoice(forced, tools, call("search"))).toContain("write");
+    expect(checkToolChoice(forced, tools, { calls: [] })).toContain("write");
+  });
+
+  it("does not constrain auto", () => {
+    expect(checkToolChoice("auto", tools, { calls: [] })).toBeNull();
+    expect(checkToolChoice(undefined, tools, call("search"))).toBeNull();
+  });
+});
+
+describe("fingerprintMessages", () => {
+  it("is stable across client re-serialisation", () => {
+    const original = [
+      { role: "user", content: "go" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "c1", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } },
+        ],
+      },
+    ] as any[];
+    const roundTripped = [
+      { role: "user", content: "go" },
+      {
+        role: "assistant",
+        content: null,
+        refusal: null,
+        audio: null,
+        annotations: null,
+        tool_calls: [
+          { function: { arguments: '{"command":"ls"}', name: "bash" }, id: "c1", type: "function" },
+        ],
+      },
+    ] as any[];
+    expect(fingerprintMessages(roundTripped)).toBe(fingerprintMessages(original));
+  });
+
+  it("ignores tool-call ids but not names or arguments", () => {
+    const a = [
+      { role: "assistant", content: null, tool_calls: [{ id: "x", type: "function", function: { name: "f", arguments: "{}" } }] },
+    ] as any[];
+    const b = [
+      { role: "assistant", content: null, tool_calls: [{ id: "y", type: "function", function: { name: "f", arguments: "{}" } }] },
+    ] as any[];
+    const c = [
+      { role: "assistant", content: null, tool_calls: [{ id: "x", type: "function", function: { name: "g", arguments: "{}" } }] },
+    ] as any[];
+    expect(fingerprintMessages(a)).toBe(fingerprintMessages(b));
+    expect(fingerprintMessages(a)).not.toBe(fingerprintMessages(c));
+  });
+
+  it("treats string and content-part forms as the same text", () => {
+    expect(
+      fingerprintMessages([{ role: "user", content: [{ type: "text", text: "hi" }] }] as any[])
+    ).toBe(fingerprintMessages([{ role: "user", content: "hi" }] as any[]));
+  });
+
+  it("changes when a message is edited", () => {
+    const a = fingerprintMessages([{ role: "user", content: "one" }] as any[]);
+    const b = fingerprintMessages([{ role: "user", content: "two" }] as any[]);
+    expect(a).not.toBe(b);
   });
 });
 

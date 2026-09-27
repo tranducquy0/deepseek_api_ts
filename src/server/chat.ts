@@ -11,10 +11,12 @@ import type {
 import { SessionManager } from "./sessions.js";
 import {
   buildPrompt,
+  checkToolChoice,
   contentToText,
   createStreamState,
   applyStreamEvent,
   extractToolCalls,
+  fingerprintMessages,
   makeChunk,
   makeToolCallChunk,
   makeUsageChunk,
@@ -101,17 +103,52 @@ function conversationKey(body: OpenAIChatRequest): string {
  * messages in `delta` are skipped because the DeepSeek session already holds
  * the assistant's previous response as the parent message node.
  */
-export function forwardMessages(
+export interface ForwardPlan {
+  /** The messages to send to DeepSeek this turn. */
+  delta: OpenAIMessage[];
+  /**
+   * True when the client rewrote history it had already sent, so the DeepSeek
+   * session no longer describes it and must be rebuilt from scratch.
+   */
+  replay: boolean;
+}
+
+/**
+ * Decide which messages to forward, given what the DeepSeek session has
+ * already seen.
+ *
+ * Slicing by message count alone silently corrupts a conversation whose client
+ * compacts its history: the slice lands in the wrong place, and the fallback
+ * drops the user's actual new turn. So the already-forwarded prefix is
+ * fingerprinted and compared — an exact match means the client only appended,
+ * and anything else means history was rewritten.
+ *
+ * When continuing a session, leading assistant messages in `delta` are skipped
+ * because the DeepSeek session already holds the assistant's previous response
+ * as the parent message node. A replay has no such parent, so it forwards
+ * everything.
+ */
+export function planForward(
   messages: OpenAIMessage[],
-  forwarded: number
-): OpenAIMessage[] {
+  entry: { lastMessageCount: number; historyDigest: string | null }
+): ForwardPlan {
+  const forwarded = entry.lastMessageCount;
+  if (forwarded === 0) return { delta: messages, replay: false };
+
+  const prefix = messages.slice(0, forwarded);
+  const intact =
+    prefix.length === forwarded &&
+    entry.historyDigest !== null &&
+    fingerprintMessages(prefix) === entry.historyDigest;
+
+  if (!intact) return { delta: messages, replay: true };
+
   let delta = messages.slice(forwarded);
-  if (forwarded > 0) {
-    while (delta.length > 0 && delta[0].role === "assistant") {
-      delta = delta.slice(1);
-    }
+  while (delta.length > 0 && delta[0].role === "assistant") {
+    delta = delta.slice(1);
   }
-  return delta.length > 0 ? delta : messages.slice(-1);
+  // Nothing new was appended (e.g. the client retried): re-ask the last turn.
+  return { delta: delta.length > 0 ? delta : messages.slice(-1), replay: false };
 }
 
 export function chatRouter(getClient: () => DeepSeekClient): Router {
@@ -133,16 +170,38 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
     // omit `stream` cannot parse an SSE body.
     const stream = body.stream ?? false;
 
+    // A tool_choice that names a function is meaningless without tools.
+    const needsTools =
+      body.tool_choice === "required" ||
+      (typeof body.tool_choice === "object" && !!body.tool_choice?.function?.name);
+    if (needsTools && !body.tools?.length) {
+      res.status(400).json(
+        errorBody(
+          `tool_choice is ${JSON.stringify(body.tool_choice)} but no tools were provided`,
+          "invalid_request_error",
+          "tool_choice_without_tools"
+        )
+      );
+      return;
+    }
+
     let convKey: string | null = null;
     try {
       const explicitSessionId = extractExplicitSessionId(body);
       convKey = conversationKey(body);
-      const entry = await sessions.getOrCreate(client, convKey, explicitSessionId);
-      const prompt = buildPrompt(
-        forwardMessages(body.messages, entry.lastMessageCount),
-        body.tools,
-        body.tool_choice
-      );
+      let entry = await sessions.getOrCreate(client, convKey, explicitSessionId);
+      let plan = planForward(body.messages, entry);
+
+      if (plan.replay) {
+        // The client rewrote history it had already sent, so the DeepSeek
+        // session no longer matches it. Start a fresh session and replay
+        // everything, which keeps the context instead of silently sending a
+        // misaligned slice.
+        entry = await sessions.restart(client, convKey, explicitSessionId);
+        plan = { delta: body.messages, replay: false };
+      }
+
+      const prompt = buildPrompt(plan.delta, body.tools, body.tool_choice);
       const hasTools = !!body.tools?.length;
       let parentId: number | null = entry.parentMessageId;
       // One id/created pair for the whole completion, as OpenAI does.
@@ -190,12 +249,14 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
               ? state.responseMessageId
               : parentId,
           messageCount: body.messages.length,
+          historyDigest: fingerprintMessages(body.messages),
         });
 
         // In tool mode, the buffered response is only interpretable once the
         // model has finished emitting it.
         const parsed = extractToolCalls(state);
         const usage = requestUsage(sessions, convKey, state.usage);
+        const choiceError = checkToolChoice(body.tool_choice, body.tools ?? [], parsed);
 
         // A malformed tool call must not look like a finished turn: the SDK
         // raises APIError on an `error` frame, so the loop stops loudly.
@@ -203,6 +264,15 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
           res.write(
             `data: ${JSON.stringify(
               errorBody(parsed.error, "upstream_error", "tool_call_parse_failed")
+            )}\n\n`
+          );
+          res.end();
+          return;
+        }
+        if (choiceError) {
+          res.write(
+            `data: ${JSON.stringify(
+              errorBody(choiceError, "upstream_error", "tool_choice_violation")
             )}\n\n`
           );
           res.end();
@@ -257,6 +327,7 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
               ? state.responseMessageId
               : parentId,
           messageCount: body.messages.length,
+          historyDigest: fingerprintMessages(body.messages),
         });
 
         const parsed = extractToolCalls(state);
@@ -270,6 +341,14 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
             .json(
               errorBody(parsed.error, "upstream_error", "tool_call_parse_failed")
             );
+          return;
+        }
+
+        const choiceError = checkToolChoice(body.tool_choice, body.tools ?? [], parsed);
+        if (choiceError) {
+          res
+            .status(502)
+            .json(errorBody(choiceError, "upstream_error", "tool_choice_violation"));
           return;
         }
 

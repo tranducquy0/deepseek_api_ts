@@ -5,6 +5,8 @@ export interface SessionEntry {
   sessionId: string;
   parentMessageId: number | null;
   lastMessageCount: number;
+  /** Fingerprint of the message list the client last sent. */
+  historyDigest: string | null;
   updatedAt: number;
   /** Last session-cumulative token total seen for this conversation. */
   usageBaseline: number | null;
@@ -44,6 +46,34 @@ export class SessionManager {
       sessionId,
       parentMessageId: null,
       lastMessageCount: 0,
+      historyDigest: null,
+      updatedAt: Date.now(),
+      usageBaseline: null,
+    };
+    this.entries.set(key, entry);
+    return entry;
+  }
+
+  /**
+   * Replace a conversation with a fresh DeepSeek session, for when the client
+   * rewrote history the old session no longer describes. A client-pinned
+   * session id is reused as-is, since the caller owns it.
+   */
+  async restart(
+    client: DeepSeekClient,
+    key: string,
+    explicitSessionId?: string
+  ): Promise<SessionEntry> {
+    const sessionId =
+      explicitSessionId && explicitSessionId.trim().length > 0
+        ? explicitSessionId.trim()
+        : await client.createSession();
+
+    const entry: SessionEntry = {
+      sessionId,
+      parentMessageId: null,
+      lastMessageCount: 0,
+      historyDigest: null,
       updatedAt: Date.now(),
       usageBaseline: null,
     };
@@ -65,12 +95,17 @@ export class SessionManager {
   /** Persist chaining/forwarding state after a completed turn. */
   update(
     key: string,
-    state: { parentMessageId: number | string | null; messageCount: number }
+    state: {
+      parentMessageId: number | string | null;
+      messageCount: number;
+      historyDigest: string | null;
+    }
   ): void {
     const entry = this.entries.get(key);
     if (!entry) return;
     entry.parentMessageId = parseParentMessageId(state.parentMessageId);
     entry.lastMessageCount = state.messageCount;
+    entry.historyDigest = state.historyDigest;
     entry.updatedAt = Date.now();
   }
 

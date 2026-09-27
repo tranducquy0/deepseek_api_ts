@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import express from "express";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { chatRouter, forwardMessages } from "./chat.js";
+import { chatRouter, planForward } from "./chat.js";
+import { fingerprintMessages } from "../shared/convert.js";
 import type { DSStreamEvent, OpenAIChatRequest } from "../shared/types.js";
 import type { DeepSeekClient } from "../deepseek/client.js";
 
@@ -121,20 +122,155 @@ describe("chatRouter", () => {
     expect(client.chatCalls[1].prompt).toContain("Continue");
   });
 
-  it("forwardMessages skips leading assistant messages when forwarded > 0", () => {
+  it("planForward sends only the appended suffix when history is intact", () => {
     const messages = [
-      { role: "user", content: "Turn 1" },
-      { role: "assistant", content: "Resp 1" },
-      { role: "tool", content: "Tool output" },
-      { role: "user", content: "Turn 2" },
-    ] as const;
+      { role: "user", content: "turn 1" },
+      { role: "assistant", content: "resp 1" },
+      { role: "tool", content: "tool output" },
+      { role: "user", content: "turn 2" },
+    ] as any[];
+    const entry = {
+      lastMessageCount: 2,
+      historyDigest: fingerprintMessages(messages.slice(0, 2)),
+    };
 
-    // Turn 1 forwarded 1 message
-    const delta = forwardMessages(messages as any, 1);
-    expect(delta).toEqual([
-      { role: "tool", content: "Tool output" },
-      { role: "user", content: "Turn 2" },
-    ]);
+    const plan = planForward(messages, entry);
+    expect(plan.replay).toBe(false);
+    // The leading assistant message is skipped: the DeepSeek session already
+    // holds it as the parent node.
+    expect(plan.delta.map((m: any) => m.role)).toEqual(["tool", "user"]);
+  });
+
+  it("planForward replays everything when the client rewrote history", () => {
+    // A client that compacts history replaces old turns with a summary.
+    const before = [
+      { role: "user", content: "turn 1" },
+      { role: "assistant", content: "resp 1" },
+    ] as any[];
+    const compacted = [
+      { role: "user", content: "SUMMARY of turn 1" },
+      { role: "user", content: "turn 2" },
+    ] as any[];
+
+    const plan = planForward(compacted, {
+      lastMessageCount: 2,
+      historyDigest: fingerprintMessages(before),
+    });
+    expect(plan.replay).toBe(true);
+    expect(plan.delta).toEqual(compacted);
+  });
+
+  it("planForward replays when the client sends fewer messages than before", () => {
+    const plan = planForward([{ role: "user", content: "only" }] as any[], {
+      lastMessageCount: 5,
+      historyDigest: "whatever",
+    });
+    expect(plan.replay).toBe(true);
+  });
+
+  it("planForward re-asks the last turn when the client appended nothing", () => {
+    const messages = [{ role: "user", content: "turn 1" }] as any[];
+    const plan = planForward(messages, {
+      lastMessageCount: 1,
+      historyDigest: fingerprintMessages(messages),
+    });
+    expect(plan.replay).toBe(false);
+    expect(plan.delta).toEqual(messages);
+  });
+
+  it("keeps the conversation when the client echoes a response through its SDK", () => {
+    // The Python SDK re-serialises the assistant message with null padding and
+    // reordered keys; that must not read as rewritten history.
+    const original = [
+      { role: "user", content: "run it" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "call_1", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } },
+        ],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "a.txt" },
+    ] as any[];
+    const roundTripped = [
+      { role: "user", content: "run it" },
+      {
+        refusal: null,
+        annotations: null,
+        audio: null,
+        function_call: null,
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { function: { arguments: '{"command":"ls"}', name: "bash" }, id: "call_1", type: "function" },
+        ],
+      },
+      { tool_call_id: "call_1", content: "a.txt", role: "tool" },
+    ] as any[];
+    const next = [...roundTripped, { role: "user", content: "and again" }] as any[];
+
+    const plan = planForward(next, {
+      lastMessageCount: 3,
+      historyDigest: fingerprintMessages(original),
+    });
+    expect(plan.replay).toBe(false);
+    expect(plan.delta.map((m: any) => m.role)).toEqual(["user"]);
+  });
+
+  it("rebuilds the session and replays when the client compacts history", async () => {
+    client.events = STANDARD_EVENTS;
+    await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "original long question" }],
+      stream: false,
+    });
+    expect(client.sessionCalls).toBe(1);
+
+    // The client compacted the first turn away and appended a new one.
+    client.events = STANDARD_EVENTS;
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [
+        { role: "user", content: "SUMMARY: the original question" },
+        { role: "user", content: "follow up" },
+      ],
+      stream: false,
+    });
+    expect(res.status).toBe(200);
+
+    // A fresh DeepSeek session, with the whole rewritten history replayed into
+    // it — not a misaligned slice of the old conversation.
+    expect(client.sessionCalls).toBe(2);
+    expect(client.chatCalls[1].chatSessionId).not.toBe(client.chatCalls[0].chatSessionId);
+    expect(client.chatCalls[1].parentMessageId).toBeNull();
+    const prompt = client.chatCalls[1].prompt;
+    expect(prompt).toContain("SUMMARY: the original question");
+    expect(prompt).toContain("follow up");
+  });
+
+  it("chains normally when the client only appends", async () => {
+    client.events = STANDARD_EVENTS;
+    await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "first" }],
+      stream: false,
+    });
+    client.events = STANDARD_EVENTS;
+    await post({
+      model: "deepseek-chat",
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: "Hello there" },
+        { role: "user", content: "second" },
+      ],
+      stream: false,
+    });
+
+    expect(client.sessionCalls).toBe(1);
+    expect(client.chatCalls[1].chatSessionId).toBe(client.chatCalls[0].chatSessionId);
+    expect(client.chatCalls[1].parentMessageId).toBe(12345);
+    expect(client.chatCalls[1].prompt).toContain("second");
+    expect(client.chatCalls[1].prompt).not.toContain("Hello there");
   });
 
   it("streams SSE events", async () => {
@@ -484,25 +620,27 @@ describe("chatRouter", () => {
       { p: "response", o: "BATCH", v: [{ p: "accumulated_token_usage", v: total }] },
       { p: "response/status", v: "FINISHED" },
     ];
-    const ask = (content: string) =>
-      post({
-        model: "deepseek-chat",
-        messages: [{ role: "user", content }],
-        user: "usage-conv",
-        stream: false,
-      });
+    const ask = (messages: OpenAIMessage[]) =>
+      post({ model: "deepseek-chat", messages, user: "usage-conv", stream: false });
 
     client.events = withUsage(300);
-    const first = (await (await ask("usage turn one")).json()) as {
-      usage: { total_tokens: number };
-    };
-    client.events = withUsage(593);
-    const second = (await (await ask("usage turn two")).json()) as {
+    const first = (await (await ask([{ role: "user", content: "turn one" }])).json()) as {
       usage: { total_tokens: number };
     };
 
+    // Appended, not rewritten, so the session is reused and usage is diffed.
+    client.events = withUsage(593);
+    const second = (
+      await (
+        await ask([
+          { role: "user", content: "turn one" },
+          { role: "assistant", content: "ok" },
+          { role: "user", content: "turn two" },
+        ])
+      ).json()
+    ) as { usage: { total_tokens: number } };
+
     expect(first.usage.total_tokens).toBe(300);
-    // DeepSeek accumulates across the session; each turn reports its own cost.
     expect(second.usage.total_tokens).toBe(293);
   });
 
@@ -552,6 +690,107 @@ describe("chatRouter", () => {
     // the conversation.
     expect(client.sessionCalls).toBe(1);
     expect(client.chatCalls[1].prompt).toContain("and again");
+  });
+
+  it("fails loudly when tool_choice required is not honoured", async () => {
+    // The model answered in prose. A 200 + finish_reason "stop" would tell the
+    // agent loop the model chose to finish, which is not what happened.
+    client.events = [
+      { o: "APPEND", p: "response/fragments/-1/content", v: "I cannot call tools." },
+      { p: "response/status", v: "FINISHED" },
+    ];
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "use a tool" }],
+      tools: [{ type: "function", function: { name: "search", parameters: {} } }],
+      tool_choice: "required",
+      stream: false,
+    });
+    expect(res.status).toBe(502);
+    const json = (await res.json()) as { error: { code: string; message: string } };
+    expect(json.error.code).toBe("tool_choice_violation");
+    expect(json.error.message).toContain('"search"');
+  });
+
+  it("passes when tool_choice required is honoured", async () => {
+    client.events = [
+      {
+        o: "APPEND",
+        p: "response/fragments/-1/content",
+        v: '{"name":"search","arguments":{"q":"x"}}',
+      },
+      { p: "response/status", v: "FINISHED" },
+    ];
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "use a tool" }],
+      tools: [{ type: "function", function: { name: "search", parameters: {} } }],
+      tool_choice: "required",
+      stream: false,
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { choices: { finish_reason: string }[] };
+    expect(json.choices[0].finish_reason).toBe("tool_calls");
+  });
+
+  it("rejects tool_choice required without tools", async () => {
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "no tools here" }],
+      tool_choice: "required",
+      stream: false,
+    });
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: { code: string } };
+    expect(json.error.code).toBe("tool_choice_without_tools");
+    // No upstream call should have been made.
+    expect(client.chatCalls).toHaveLength(0);
+  });
+
+  it("enforces a forced tool_choice function", async () => {
+    client.events = [
+      {
+        o: "APPEND",
+        p: "response/fragments/-1/content",
+        v: '{"name":"search","arguments":{}}',
+      },
+      { p: "response/status", v: "FINISHED" },
+    ];
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "force one" }],
+      tools: [
+        { type: "function", function: { name: "search", parameters: {} } },
+        { type: "function", function: { name: "write", parameters: {} } },
+      ],
+      tool_choice: { type: "function", function: { name: "write" } },
+      stream: false,
+    });
+    expect(res.status).toBe(502);
+    const json = (await res.json()) as { error: { code: string; message: string } };
+    expect(json.error.code).toBe("tool_choice_violation");
+    expect(json.error.message).toContain("write");
+  });
+
+  it("rejects a tool call when tool_choice is none", async () => {
+    client.events = [
+      {
+        o: "APPEND",
+        p: "response/fragments/-1/content",
+        v: '{"name":"search","arguments":{}}',
+      },
+      { p: "response/status", v: "FINISHED" },
+    ];
+    const res = await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "no tools please" }],
+      tools: [{ type: "function", function: { name: "search", parameters: {} } }],
+      tool_choice: "none",
+      stream: false,
+    });
+    expect(res.status).toBe(502);
+    const json = (await res.json()) as { error: { code: string } };
+    expect(json.error.code).toBe("tool_choice_violation");
   });
 
   it("uses explicit chat_session_id from body when provided", async () => {
