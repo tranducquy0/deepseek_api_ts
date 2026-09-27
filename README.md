@@ -174,6 +174,14 @@ not trigger a replay. A client that mutates an *earlier* message every turn — 
 timestamped system prompt, for instance — will replay each turn, which costs tokens but
 still preserves context.
 
+Turns on the same conversation run **one at a time**. A conversation is a single DeepSeek
+session with one `parent_message_id` pointer, so overlapping requests would race and
+orphan each other's messages. Requests for different conversations stay fully parallel.
+
+If the client disconnects mid-answer, the upstream stream is aborted instead of being
+read to completion, and the response id DeepSeek already reported is kept — so the next
+turn continues from that message rather than leaving it orphaned in the session.
+
 ## Development
 
 ```sh
@@ -189,8 +197,8 @@ npm run dev     # tsx hot-run src/cli.ts
 - Tokens are stored in **plaintext** on disk.
 - Multimodal input is flattened to text; image and other attachment parts are **not**
   forwarded (see [Message content](#message-content)).
-- One DeepSeek session per conversation; concurrent requests to the same conversation are
-  last-writer-wins.
+- One DeepSeek session per conversation; turns on the same conversation are serialised,
+  so a slow turn queues rather than failing.
 - `tool_choice` is verified after the turn, but a violation surfaces as an error rather
   than a retry.
 - Rewritten client history is replayed into a new DeepSeek session, which costs tokens.
@@ -199,7 +207,5 @@ npm run dev     # tsx hot-run src/cli.ts
 
 ## Roadmap
 
-- Abort upstream DeepSeek stream when the client disconnects
-- Serialize turns per conversation, or reject concurrent ones with `409`
 - Account info endpoint and `ds status` CLI command
 - Configurable bind host for LAN access

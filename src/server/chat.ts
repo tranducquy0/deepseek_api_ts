@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { Router, type Request, type Response } from "express";
-import { DeepSeekClient, AuthExpiredError, parseParentMessageId } from "../deepseek/client.js";
+import { DeepSeekClient, AuthExpiredError } from "../deepseek/client.js";
 import type {
   AuthData,
   CompletionUsage,
@@ -9,6 +9,7 @@ import type {
   OpenAIToolCall,
 } from "../shared/types.js";
 import { SessionManager } from "./sessions.js";
+import { KeyedSerialQueue } from "./queue.js";
 import {
   buildPrompt,
   checkToolChoice,
@@ -63,6 +64,10 @@ function requestUsage(
 
 // Tracks DeepSeek sessions across turns, keyed by conversation.
 const sessions = new SessionManager();
+
+// One turn at a time per conversation, so concurrent requests cannot race on
+// the session's parent pointer and forwarding state.
+const turns = new KeyedSerialQueue();
 
 function extractExplicitSessionId(body: OpenAIChatRequest): string | undefined {
   const req = body as unknown as {
@@ -185,229 +190,263 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
       return;
     }
 
-    let convKey: string | null = null;
-    try {
-      const explicitSessionId = extractExplicitSessionId(body);
-      convKey = conversationKey(body);
-      let entry = await sessions.getOrCreate(client, convKey, explicitSessionId);
-      let plan = planForward(body.messages, entry);
-
-      if (plan.replay) {
-        // The client rewrote history it had already sent, so the DeepSeek
-        // session no longer matches it. Start a fresh session and replay
-        // everything, which keeps the context instead of silently sending a
-        // misaligned slice.
-        entry = await sessions.restart(client, convKey, explicitSessionId);
-        plan = { delta: body.messages, replay: false };
+    const convKey = conversationKey(body);
+    const abort = new AbortController();
+    let clientGone = false;
+    // Fires on a normal res.end() too, so the finished check is what
+    // distinguishes a disconnect from a completed response.
+    const onClose = () => {
+      if (!res.writableFinished) {
+        clientGone = true;
+        abort.abort();
       }
+    };
+    res.on("close", onClose);
 
-      const prompt = buildPrompt(plan.delta, body.tools, body.tool_choice);
-      const hasTools = !!body.tools?.length;
-      let parentId: number | null = entry.parentMessageId;
-      // One id/created pair for the whole completion, as OpenAI does.
-      const completion = newCompletionMeta();
+    try {
+      await turns.run(convKey, async () => {
+        const explicitSessionId = extractExplicitSessionId(body);
+        let entry = await sessions.getOrCreate(client, convKey, explicitSessionId);
+        let plan = planForward(body.messages, entry);
 
-      if (stream) {
-        // ── Streaming response ──────────────────────────────
-        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("X-Accel-Buffering", "no");
+        if (plan.replay) {
+          // The client rewrote history it had already sent, so the DeepSeek
+          // session no longer matches it. Start a fresh session and replay
+          // everything, which keeps the context instead of silently sending a
+          // misaligned slice.
+          entry = await sessions.restart(client, convKey, explicitSessionId);
+          plan = { delta: body.messages, replay: false };
+        }
 
-        // Send initial role chunk
-        const initChunk = makeChunk(completion, modelId, { role: "assistant" });
-        res.write(`data: ${JSON.stringify(initChunk)}\n\n`);
+        const prompt = buildPrompt(plan.delta, body.tools, body.tool_choice);
+        const hasTools = !!body.tools?.length;
+        let parentId: number | null = entry.parentMessageId;
+        // One id/created pair for the whole completion, as OpenAI does.
+        const completion = newCompletionMeta();
+        const chainState = {
+          messageCount: body.messages.length,
+          historyDigest: fingerprintMessages(body.messages),
+        };
+        let chained = false;
 
-        const state = createStreamState(hasTools, body.tools);
+        /** Persist the chaining state once DeepSeek reveals the response id. */
+        const chainIfKnown = (responseMessageId: number | null): void => {
+          if (chained || responseMessageId == null) return;
+          chained = true;
+          parentId = responseMessageId;
+          // Persisted immediately rather than after the stream finishes: a turn
+          // cut short by a client disconnect has still created a message in the
+          // DeepSeek session, and the next turn must chain from it instead of
+          // orphaning it.
+          sessions.update(convKey, { ...chainState, parentMessageId: responseMessageId });
+        };
 
-        for await (const event of client.chatCompletion({
-          chatSessionId: entry.sessionId,
-          parentMessageId: parentId,
-          prompt,
-          thinkingEnabled,
-          modelType: dsModelType,
-        })) {
-          const delta = applyStreamEvent(state, event);
+        if (stream) {
+          // ── Streaming response ──────────────────────────────
+          res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+          res.setHeader("Cache-Control", "no-cache");
+          res.setHeader("Connection", "keep-alive");
+          res.setHeader("X-Accel-Buffering", "no");
 
-          // Capture parent_message_id for subsequent turns
-          if (event.p === "response/message_id" && event.v != null) {
-            parentId = parseParentMessageId(event.v as string | number);
+          // Send initial role chunk
+          const initChunk = makeChunk(completion, modelId, { role: "assistant" });
+          res.write(`data: ${JSON.stringify(initChunk)}\n\n`);
+
+          const state = createStreamState(hasTools, body.tools);
+
+          for await (const event of client.chatCompletion({
+            chatSessionId: entry.sessionId,
+            parentMessageId: parentId,
+            prompt,
+            thinkingEnabled,
+            modelType: dsModelType,
+            signal: abort.signal,
+          })) {
+            const delta = applyStreamEvent(state, event);
+
+            // DeepSeek reports the response id on its opening frame, long before
+            // the answer finishes.
+            chainIfKnown(state.responseMessageId);
+
+            if (delta.content || delta.reasoning) {
+              const chunk = makeChunk(completion, modelId, {
+                ...(delta.content ? { content: delta.content } : {}),
+                ...(delta.reasoning ? { reasoning_content: delta.reasoning } : {}),
+              });
+              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            }
           }
 
-          if (delta.content || delta.reasoning) {
-            const chunk = makeChunk(completion, modelId, {
-              ...(delta.content ? { content: delta.content } : {}),
-              ...(delta.reasoning ? { reasoning_content: delta.reasoning } : {}),
-            });
+          sessions.update(convKey, {
+            parentMessageId:
+              state.responseMessageId != null
+                ? state.responseMessageId
+                : parentId,
+            ...chainState,
+          });
+
+          // In tool mode, the buffered response is only interpretable once the
+          // model has finished emitting it.
+          const parsed = extractToolCalls(state);
+          const usage = requestUsage(sessions, convKey, state.usage);
+          const choiceError = checkToolChoice(body.tool_choice, body.tools ?? [], parsed);
+
+          // A malformed tool call must not look like a finished turn: the SDK
+          // raises APIError on an `error` frame, so the loop stops loudly.
+          if (parsed.error) {
+            res.write(
+              `data: ${JSON.stringify(
+                errorBody(parsed.error, "upstream_error", "tool_call_parse_failed")
+              )}\n\n`
+            );
+            res.end();
+            return;
+          }
+          if (choiceError) {
+            res.write(
+              `data: ${JSON.stringify(
+                errorBody(choiceError, "upstream_error", "tool_choice_violation")
+              )}\n\n`
+            );
+            res.end();
+            return;
+          }
+
+          if (parsed.calls.length > 0) {
+            if (parsed.leadingText) {
+              const leadingChunk = makeChunk(completion, modelId, {
+                content: parsed.leadingText,
+              });
+              res.write(`data: ${JSON.stringify(leadingChunk)}\n\n`);
+            }
+            const chunk = makeToolCallChunk(completion, modelId, parsed.calls);
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          } else if (state.hasTools && state.content) {
+            const chunk = makeChunk(completion, modelId, { content: state.content });
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
           }
-        }
 
-        sessions.update(convKey, {
-          parentMessageId:
-            state.responseMessageId != null
-              ? state.responseMessageId
-              : parentId,
-          messageCount: body.messages.length,
-          historyDigest: fingerprintMessages(body.messages),
-        });
-
-        // In tool mode, the buffered response is only interpretable once the
-        // model has finished emitting it.
-        const parsed = extractToolCalls(state);
-        const usage = requestUsage(sessions, convKey, state.usage);
-        const choiceError = checkToolChoice(body.tool_choice, body.tools ?? [], parsed);
-
-        // A malformed tool call must not look like a finished turn: the SDK
-        // raises APIError on an `error` frame, so the loop stops loudly.
-        if (parsed.error) {
-          res.write(
-            `data: ${JSON.stringify(
-              errorBody(parsed.error, "upstream_error", "tool_call_parse_failed")
-            )}\n\n`
-          );
-          res.end();
-          return;
-        }
-        if (choiceError) {
-          res.write(
-            `data: ${JSON.stringify(
-              errorBody(choiceError, "upstream_error", "tool_choice_violation")
-            )}\n\n`
-          );
-          res.end();
-          return;
-        }
-
-        if (parsed.calls.length > 0) {
-          if (parsed.leadingText) {
-            const leadingChunk = makeChunk(completion, modelId, {
-              content: parsed.leadingText,
-            });
-            res.write(`data: ${JSON.stringify(leadingChunk)}\n\n`);
+          if (body.stream_options?.include_usage && usage) {
+            const usageChunk = makeUsageChunk(completion, modelId, usage);
+            res.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
           }
-          const chunk = makeToolCallChunk(completion, modelId, parsed.calls);
-          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        } else if (state.hasTools && state.content) {
-          const chunk = makeChunk(completion, modelId, { content: state.content });
-          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        }
 
-        if (body.stream_options?.include_usage && usage) {
-          const usageChunk = makeUsageChunk(completion, modelId, usage);
-          res.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
-        }
+          // Send final chunk. finish_reason is set exactly once per stream.
+          const finishReason = parsed.calls.length > 0 ? "tool_calls" : "stop";
+          const finalChunk = makeChunk(completion, modelId, {}, finishReason);
+          res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } else {
+          // ── Non-streaming response ──────────────────────────
+          const state = createStreamState(hasTools, body.tools);
 
-        // Send final chunk. finish_reason is set exactly once per stream.
-        const finishReason = parsed.calls.length > 0 ? "tool_calls" : "stop";
-        const finalChunk = makeChunk(completion, modelId, {}, finishReason);
-        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-        res.write("data: [DONE]\n\n");
-        res.end();
-      } else {
-        // ── Non-streaming response ──────────────────────────
-        const state = createStreamState(hasTools, body.tools);
-
-        for await (const event of client.chatCompletion({
-          chatSessionId: entry.sessionId,
-          parentMessageId: parentId,
-          prompt,
-          thinkingEnabled,
-          modelType: dsModelType,
-        })) {
-          applyStreamEvent(state, event);
-          if (event.p === "response/message_id" && event.v != null) {
-            parentId = parseParentMessageId(event.v as string | number);
+          for await (const event of client.chatCompletion({
+            chatSessionId: entry.sessionId,
+            parentMessageId: parentId,
+            prompt,
+            thinkingEnabled,
+            modelType: dsModelType,
+            signal: abort.signal,
+          })) {
+            applyStreamEvent(state, event);
+            chainIfKnown(state.responseMessageId);
           }
-        }
 
-        sessions.update(convKey, {
-          parentMessageId:
-            state.responseMessageId != null
-              ? state.responseMessageId
-              : parentId,
-          messageCount: body.messages.length,
-          historyDigest: fingerprintMessages(body.messages),
-        });
+          sessions.update(convKey, {
+            parentMessageId:
+              state.responseMessageId != null
+                ? state.responseMessageId
+                : parentId,
+            ...chainState,
+          });
 
-        const parsed = extractToolCalls(state);
-        const usage = requestUsage(sessions, convKey, state.usage);
+          const parsed = extractToolCalls(state);
+          const usage = requestUsage(sessions, convKey, state.usage);
 
-        // Fail loudly rather than returning a clean stop that an agent loop
-        // would read as "the model finished without calling a tool".
-        if (parsed.error) {
-          res
-            .status(502)
-            .json(
-              errorBody(parsed.error, "upstream_error", "tool_call_parse_failed")
-            );
-          return;
-        }
+          // Fail loudly rather than returning a clean stop that an agent loop
+          // would read as "the model finished without calling a tool".
+          if (parsed.error) {
+            res
+              .status(502)
+              .json(
+                errorBody(parsed.error, "upstream_error", "tool_call_parse_failed")
+              );
+            return;
+          }
 
-        const choiceError = checkToolChoice(body.tool_choice, body.tools ?? [], parsed);
-        if (choiceError) {
-          res
-            .status(502)
-            .json(errorBody(choiceError, "upstream_error", "tool_choice_violation"));
-          return;
-        }
+          const choiceError = checkToolChoice(body.tool_choice, body.tools ?? [], parsed);
+          if (choiceError) {
+            res
+              .status(502)
+              .json(errorBody(choiceError, "upstream_error", "tool_choice_violation"));
+            return;
+          }
 
-        const reasoning = state.thinking || undefined;
-        const message: OpenAIMessage =
-          parsed.calls.length > 0
-            ? {
-                role: "assistant",
-                content: parsed.leadingText || null,
-                ...(reasoning ? { reasoning_content: reasoning } : {}),
-                tool_calls: parsed.calls.map(
-                  (tool) =>
-                    ({
-                      id: tool.id,
-                      type: "function",
-                      function: {
-                        name: tool.name,
-                        arguments: tool.arguments,
-                      },
-                    }) satisfies OpenAIToolCall
-                ),
-              }
-            : {
-                role: "assistant",
-                content: state.content,
-                ...(reasoning ? { reasoning_content: reasoning } : {}),
-              };
-        const finishReason = parsed.calls.length > 0 ? "tool_calls" : "stop";
+          const reasoning = state.thinking || undefined;
+          const message: OpenAIMessage =
+            parsed.calls.length > 0
+              ? {
+                  role: "assistant",
+                  content: parsed.leadingText || null,
+                  ...(reasoning ? { reasoning_content: reasoning } : {}),
+                  tool_calls: parsed.calls.map(
+                    (tool) =>
+                      ({
+                        id: tool.id,
+                        type: "function",
+                        function: {
+                          name: tool.name,
+                          arguments: tool.arguments,
+                        },
+                      }) satisfies OpenAIToolCall
+                  ),
+                }
+              : {
+                  role: "assistant",
+                  content: state.content,
+                  ...(reasoning ? { reasoning_content: reasoning } : {}),
+                };
+          const finishReason = parsed.calls.length > 0 ? "tool_calls" : "stop";
 
-        res.json({
-          id: completion.id,
-          object: "chat.completion",
-          created: completion.created,
-          model: modelId,
-          choices: [
-            {
-              index: 0,
-              message,
-              finish_reason: finishReason,
+          res.json({
+            id: completion.id,
+            object: "chat.completion",
+            created: completion.created,
+            model: modelId,
+            choices: [
+              {
+                index: 0,
+                message,
+                finish_reason: finishReason,
+              },
+            ],
+            usage: usage ?? {
+              prompt_tokens: 0,
+              completion_tokens: 0,
+              total_tokens: 0,
             },
-          ],
-          usage: usage ?? {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-          },
-        });
-      }
+          });
+        }
+      });
     } catch (err) {
-      if (convKey) {
-        sessions.reset(convKey);
-      }
+      // A client that hung up is not a broken conversation: the response id was
+      // already chained when it arrived, so the next turn continues correctly.
+      // Resetting here would throw that context away.
+      if (!clientGone) sessions.reset(convKey);
+
       const authExpired = err instanceof AuthExpiredError;
       const message = authExpired
         ? "DeepSeek auth expired. Run `ds auth` to re-authenticate."
         : (err as Error).message ?? "Internal server error";
       const type = authExpired ? "auth_error" : "server_error";
 
-      console.error("Chat completion error:", err);
+      if (!clientGone) console.error("Chat completion error:", err);
+
+      if (clientGone) {
+        res.off("close", onClose);
+        return;
+      }
 
       if (res.headersSent) {
         // Already streaming. An `error` frame makes the SDK raise APIError;
@@ -421,6 +460,8 @@ export function chatRouter(getClient: () => DeepSeekClient): Router {
       res
         .status(authExpired ? 401 : 500)
         .json(errorBody(message, type));
+    } finally {
+      res.off("close", onClose);
     }
   });
 

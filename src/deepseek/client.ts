@@ -46,12 +46,14 @@ export class DeepSeekClient {
   private async request(
     path: string,
     body?: unknown,
-    extra?: Record<string, string>
+    extra?: Record<string, string>,
+    signal?: AbortSignal
   ): Promise<Response> {
     const res = await fetch(`${BASE_URL}${path}`, {
       method: body ? "POST" : "GET",
       headers: this.headers(extra),
       body: body ? JSON.stringify(body) : undefined,
+      signal,
     });
 
     if (res.status === 401) {
@@ -139,6 +141,8 @@ export class DeepSeekClient {
     prompt: string;
     thinkingEnabled: boolean;
     modelType: string;
+    /** Aborted when the client disconnects, to stop reading the upstream stream. */
+    signal?: AbortSignal;
   }): AsyncGenerator<DSStreamEvent> {
     if (!params.chatSessionId || typeof params.chatSessionId !== "string" || !params.chatSessionId.trim()) {
       throw new Error("chatSessionId is required and must be a non-empty string");
@@ -173,7 +177,8 @@ export class DeepSeekClient {
     const res = await this.request(
       "/api/v0/chat/completion",
       body,
-      { "x-ds-pow-response": powHeader }
+      { "x-ds-pow-response": powHeader },
+      params.signal
     );
 
     if (!res.ok) {

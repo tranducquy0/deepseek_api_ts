@@ -18,6 +18,21 @@ class FakeClient {
   sessionCalls = 0;
   chatCalls: ChatCall[] = [];
   events: DSStreamEvent[] = [];
+  /** One entry per finished turn: how many events it yielded, and whether it
+   *  was abandoned before yielding all of them. */
+  yielded: number[] = [];
+  abandoned: boolean[] = [];
+  /** Resolves once a chatCompletion generator has finished. */
+  aborted: Promise<void>;
+  markAborted: () => void;
+  /** Delay before the first event, to make overlap observable. */
+  delayMs = 0;
+
+  constructor() {
+    this.aborted = new Promise((resolve) => {
+      this.markAborted = resolve;
+    });
+  }
 
   async createSession(): Promise<string> {
     this.sessionCalls++;
@@ -29,9 +44,31 @@ class FakeClient {
     parentMessageId: number | string | null;
     prompt: string;
     modelType: string;
+    signal?: AbortSignal;
   }): AsyncGenerator<DSStreamEvent> {
     this.chatCalls.push(params);
-    for (const event of this.events) yield event;
+    let yielded = 0;
+    const total = this.events.length;
+    try {
+      if (this.delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+      }
+      if (params.signal?.aborted) return;
+      for (const event of this.events) {
+        if (params.signal?.aborted) return;
+        yield event;
+        yielded += 1;
+        if (this.delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+        }
+      }
+    } finally {
+      this.yielded.push(yielded);
+      // True when the consumer walked away mid-stream, which is what an
+      // aborted upstream request looks like from here.
+      this.abandoned.push(yielded < total);
+      this.markAborted();
+    }
   }
 }
 
@@ -791,6 +828,141 @@ describe("chatRouter", () => {
     expect(res.status).toBe(502);
     const json = (await res.json()) as { error: { code: string } };
     expect(json.error.code).toBe("tool_choice_violation");
+  });
+
+  it("serialises concurrent turns on the same conversation", async () => {
+    client.events = STANDARD_EVENTS;
+    client.delayMs = 20;
+
+    // Without serialisation both turns would be in flight at once and the
+    // second would overwrite the first's parent pointer.
+    const results = await Promise.all([
+      post({ model: "deepseek-chat", messages: [{ role: "user", content: "turn one" }], user: "shared" }),
+      post({
+        model: "deepseek-chat",
+        messages: [
+          { role: "user", content: "turn one" },
+          { role: "assistant", content: "Hello there" },
+          { role: "user", content: "turn two" },
+        ],
+        user: "shared",
+      }),
+    ]);
+    for (const res of results) expect(res.status).toBe(200);
+
+    // One DeepSeek session, and the second turn chained from the first's
+    // response instead of racing it.
+    expect(client.sessionCalls).toBe(1);
+    expect(client.chatCalls).toHaveLength(2);
+    expect(client.chatCalls[1].parentMessageId).toBe(12345);
+    expect(client.chatCalls[1].prompt).toContain("turn two");
+  });
+
+  it("stops reading the upstream stream when the client disconnects", async () => {
+    client.events = STANDARD_EVENTS;
+    client.delayMs = 40;
+
+    const controller = new AbortController();
+    const pending = fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: [{ role: "user", content: "abort me" }],
+        stream: true,
+      }),
+      signal: controller.signal,
+    });
+
+    // Headers are sent immediately, so the response resolves; the body is
+    // where the disconnect shows up.
+    const res = await pending;
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+    // Wait until the upstream turn is genuinely underway (events arrive every
+    // delayMs), then hang up mid-stream.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await res.body?.cancel();
+    controller.abort();
+    await client.aborted;
+
+    // Stopped partway through, which only happens if the abort signal reached
+    // the upstream generator.
+    expect(client.yielded[0]).toBeGreaterThan(0);
+    expect(client.yielded[0]).toBeLessThan(client.events.length);
+  });
+
+  it("stays healthy and keeps context after a client disconnects", async () => {
+    client.events = [
+      { response_message_id: 777, request_message_id: 1 },
+      { o: "APPEND", p: "response/fragments/-1/content", v: "partial" },
+      { p: "response/status", v: "FINISHED" },
+    ] as DSStreamEvent[];
+    client.delayMs = 40;
+
+    const controller = new AbortController();
+    const pending = fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: [{ role: "user", content: "interrupted" }],
+        stream: true,
+        user: "after-abort",
+      }),
+      signal: controller.signal,
+    });
+    const res = await pending;
+    // Let the response id arrive so the early chaining has something to store.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await res.body?.cancel();
+    controller.abort();
+    await client.aborted;
+
+    // A disconnect must not discard the conversation: the response id was
+    // chained when it arrived, so the next turn continues from it.
+    client.delayMs = 0;
+    client.events = STANDARD_EVENTS;
+    const next = await post({
+      model: "deepseek-chat",
+      messages: [
+        { role: "user", content: "interrupted" },
+        { role: "assistant", content: "partial" },
+        { role: "user", content: "carry on" },
+      ],
+      user: "after-abort",
+    });
+    expect(next.status).toBe(200);
+    expect(client.chatCalls[1].parentMessageId).toBe(777);
+    expect(client.sessionCalls).toBe(1);
+  });
+
+  it("chains the next turn from a response id learned before completion", async () => {
+    // A turn cut short still created a message in the DeepSeek session, so the
+    // response id must be persisted as soon as it arrives.
+    client.events = [
+      { response_message_id: 555, request_message_id: 1 },
+      { o: "APPEND", p: "response/fragments/-1/content", v: "partial" },
+      { p: "response/status", v: "FINISHED" },
+    ] as DSStreamEvent[];
+
+    await post({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "first" }],
+      user: "recover",
+    });
+    client.events = STANDARD_EVENTS;
+    await post({
+      model: "deepseek-chat",
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: "partial" },
+        { role: "user", content: "second" },
+      ],
+      user: "recover",
+    });
+
+    expect(client.chatCalls[1].parentMessageId).toBe(555);
   });
 
   it("uses explicit chat_session_id from body when provided", async () => {
